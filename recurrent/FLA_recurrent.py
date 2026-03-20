@@ -1,10 +1,12 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 
+import math
 import torch
 import triton
 import triton.language as tl
 import triton.language.extra.libdevice as tldevice
+import torch.nn.functional as F
 
 @triton.jit
 def exp(x): return tldevice.fast_expf(x.to(tl.float32))
@@ -156,50 +158,63 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
-def fused_recurrent_gated_delta_rule_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor | None = None,
-    gk: torch.Tensor | None = None,
-    gv: torch.Tensor | None = None,
-    beta: torch.Tensor | None = None,
-    scale: float = None,
-    initial_state: torch.Tensor = None,
-    output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = False,
-    cu_seqlens: torch.LongTensor | None = None,
-    transpose_state_layout: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    B, T, H, K, V = *k.shape, v.shape[-1]
-    HV = v.shape[2]
-    N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK = triton.next_power_of_2(K)
-    BV = min(8, triton.next_power_of_2(V)) if gv is None else triton.next_power_of_2(V)
-    NV = triton.cdiv(V, BV)
-    # print(f"NV: {NV}, N: {N}, HV: {HV}, BK: {BK}, BV: {BV}")
-    o = torch.empty_like(v)
-    if output_final_state:
-        if transpose_state_layout:
-            final_state = q.new_empty(N, HV, V, K, dtype=torch.float32)
-        else:
-            final_state = q.new_empty(N, HV, K, V, dtype=torch.float32)
-    else:
-        final_state = None
 
-    grid = (NV, N * HV)
+
+# =============================================================================
+# 官方评测框架的入口包装 (Wrapper)
+# =============================================================================
+def kernel(
+    q: torch.Tensor,        # [B, 1, 4, 128] bf16
+    k: torch.Tensor,        # [B, 1, 4, 128] bf16
+    v: torch.Tensor,        # [B, 1, 8, 128] bf16
+    state: torch.Tensor,    # [B, 8, 128, 128] f32 (k-last 即 [B, HV, V, K])
+    A_log: torch.Tensor,    # [8] f32
+    a: torch.Tensor,        # [B, 1, 8] bf16
+    dt_bias: torch.Tensor,  # [8] f32
+    b: torch.Tensor,        # [B, 1, 8] bf16
+    scale: float,           # float32 scalar
+    output: torch.Tensor,   # [B, 1, 8, 128] bf16 (DPS 预分配输出)
+    new_state: torch.Tensor # [B, 8, 128, 128] f32 (DPS 预分配状态)
+):
+    B = q.shape[0]
+    T = q.shape[1]
+    H = q.shape[2]
+    K = q.shape[3]
+    HV = v.shape[2]
+    V = v.shape[3]
+
+    if scale is None or scale == 0.0:
+        scale = 1.0 / math.sqrt(K)
+
+    # 1. 预计算 decay (g) 和 gate (beta)
+    # FLA kernel 内部调用的是 exp(g)，所以这里我们传入的应该是真正的 log(decay) 值
+    x = a.float() + dt_bias.float()
+    log_decay = -torch.exp(A_log.float()) * F.softplus(x)  # [B, 1, HV]
+
+    # beta = sigmoid(b)
+    beta_gate = torch.sigmoid(b.float())  # [B, 1, HV]
+
+    # 2. 准备配置参数
+    BK = triton.next_power_of_2(K)
+    BV = min(8, triton.next_power_of_2(V))
+    NV = triton.cdiv(V, BV)
+    grid = (NV, B * HV)
+
+    # 3. 启动 FLA 级别的 Triton Kernel
+    # 注意：官方的 state layout 是 k-last [B, HV, V, K]，
+    # 而 FLA 的 TRANSPOSE_STATE=True 刚好期待内存是按照 [..., V, K] 排列的。
     fused_recurrent_gated_delta_rule_fwd_kernel[grid](
         q=q,
         k=k,
         v=v,
-        g=g,
-        gk=gk,
-        gv=gv,
-        beta=beta,
-        o=o,
-        h0=initial_state,
-        ht=final_state,
-        cu_seqlens=cu_seqlens,
+        g=log_decay,      # 传入 log 形式的 decay，内核里有 exp(g)
+        gk=None,
+        gv=None,
+        beta=beta_gate,
+        o=output,         # 直接写入目标 DPS output
+        h0=state,         # 读取输入的 state
+        ht=new_state,     # 写入目标 DPS new_state
+        cu_seqlens=None,
         scale=scale,
         T=T,
         H=H,
@@ -208,230 +223,17 @@ def fused_recurrent_gated_delta_rule_fwd(
         V=V,
         BK=BK,
         BV=BV,
-        IS_BETA_HEADWISE=beta.ndim != v.ndim,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        TRANSPOSE_STATE=transpose_state_layout,
+        USE_G=True,
+        USE_GK=False,
+        USE_GV=False,
+        USE_QK_L2NORM_IN_KERNEL=False,
+        IS_BETA_HEADWISE=True,  # beta 只有 [B, T, HV]，不区分 V 维度
+        USE_INITIAL_STATE=state is not None,
+        STORE_FINAL_STATE=True,
+        TRANSPOSE_STATE=True,   # 完美适配官方的 k-last layout
+        IS_VARLEN=False,
         num_warps=1,
         num_stages=3,
     )
-    return o, final_state
 
 
-class FusedRecurrentFunction(torch.autograd.Function):
-
-    @staticmethod
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor | None = None,
-        gk: torch.Tensor | None = None,
-        gv: torch.Tensor | None = None,
-        beta: torch.Tensor | None = None,
-        scale: float = None,
-        initial_state: torch.Tensor = None,
-        output_final_state: bool = False,
-        use_qk_l2norm_in_kernel: bool = False,
-        cu_seqlens: torch.LongTensor | None = None,
-        transpose_state_layout: bool = False,
-    ):
-        o, final_state = fused_recurrent_gated_delta_rule_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            gk=gk,
-            gv=gv,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-            cu_seqlens=cu_seqlens,
-            transpose_state_layout=transpose_state_layout,
-        )
-
-        return o, final_state
-
-
-
-def fused_recurrent_gated_delta_rule(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor | None = None,
-    gk: torch.Tensor | None = None,
-    gv: torch.Tensor | None = None,
-    beta: torch.Tensor | None = None,
-    scale: float = None,
-    initial_state: torch.Tensor = None,
-    output_final_state: bool = False,
-    use_qk_l2norm_in_kernel: bool = False,
-    cu_seqlens: torch.LongTensor | None = None,
-    transpose_state_layout: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    r"""
-    Args:
-        q (torch.Tensor):
-            queries of shape `[B, T, H, K]`.
-        k (torch.Tensor):
-            keys of shape `[B, T, H, K]`.
-        v (torch.Tensor):
-            values of shape `[B, T, HV, V]`.
-            GVA is applied if `HV > H`.
-        g (torch.Tensor):
-            g (decays) of shape `[B, T, HV]`. Default: `None`.
-        gk (torch.Tensor):
-            gk (decays) of shape `[B, T, HV, K]`. Default: `None`.
-        gv (torch.Tensor):
-            gv (decays) of shape `[B, T, HV, V]`. Default: `None`.
-        beta (torch.Tensor):
-            betas of shape `[B, T, HV]`.
-        scale (Optional[float]):
-            Scale factor for the RetNet attention scores.
-            If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
-        initial_state (Optional[torch.Tensor]):
-            Initial state of shape `[N, HV, K, V]` for `N` input sequences.
-            For equal-length input sequences, `N` equals the batch size `B`.
-            Default: `None`.
-        output_final_state (Optional[bool]):
-            Whether to output the final state of shape `[N, HV, K, V]`. Default: `False`.
-        use_qk_l2norm_in_kernel (Optional[bool]):
-            Whether to use L2 normalization in the kernel. Default: `False`.
-        cu_seqlens (torch.LongTensor):
-            Cumulative sequence lengths of shape `[N+1]` used for variable-length training,
-            consistent with the FlashAttention API.
-        transpose_state_layout (bool):
-            Whether to use transposed state layout `[V, K]` instead of `[K, V]`. Default: `False`.
-
-    Returns:
-        o (torch.Tensor):
-            Outputs of shape `[B, T, HV, V]`.
-        final_state (torch.Tensor):
-            Final state of shape `[N, HV, K, V]` if `output_final_state=True` else `None`.
-
-    Examples::
-        >>> import torch
-        >>> import torch.nn.functional as F
-        >>> from einops import rearrange
-        >>> from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
-        # inputs with equal lengths
-        >>> B, T, H, HV, K, V = 4, 2048, 4, 8, 512, 512
-        >>> q = torch.randn(B, T, H, K, device='cuda')
-        >>> k = F.normalize(torch.randn(B, T, H, K, device='cuda'), p=2, dim=-1)
-        >>> v = torch.randn(B, T, HV, V, device='cuda')
-        >>> g = F.logsigmoid(torch.rand(B, T, HV, device='cuda'))
-        >>> beta = torch.rand(B, T, HV, device='cuda').sigmoid()
-        >>> h0 = torch.randn(B, HV, K, V, device='cuda')
-        >>> o, ht = fused_gated_recurrent_delta_rule(
-            q, k, v, g, beta,
-            initial_state=h0,
-            output_final_state=True
-        )
-        # for variable-length inputs, the batch size `B` is expected to be 1 and `cu_seqlens` is required
-        >>> q, k, v, g, beta = map(lambda x: rearrange(x, 'b t ... -> 1 (b t) ...'), (q, k, v, g, beta))
-        # for a batch with 4 sequences, `cu_seqlens` with 5 start/end positions are expected
-        >>> cu_seqlens = q.new_tensor([0, 2048, 4096, 6144, 8192], dtype=torch.long)
-        >>> o, ht = fused_gated_recurrent_delta_rule(
-            q, k, v, g, beta,
-            initial_state=h0,
-            output_final_state=True,
-            cu_seqlens=cu_seqlens
-        )
-    """
-    if cu_seqlens is not None:
-        if q.shape[0] != 1:
-            raise ValueError(
-                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
-                f"Please flatten variable-length inputs before processing.",
-            )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
-            raise ValueError(
-                f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
-            )
-    if scale is None:
-        scale = k.shape[-1] ** -0.5
-    if beta is None:
-        beta = torch.ones_like(q[..., 0])
-
-    o, final_state = FusedRecurrentFunction.apply(
-        q,
-        k,
-        v,
-        g,
-        gk,
-        gv,
-        beta,
-        scale,
-        initial_state,
-        output_final_state,
-        use_qk_l2norm_in_kernel,
-        cu_seqlens,
-        transpose_state_layout,
-    )
-    return o, final_state
-
-
-# =============================================================================
-# Benchmark
-# =============================================================================
-
-NUM_HEADS = 48
-DK = 128
-DV = 128
-
-
-def fla_step(q, k, v, g, beta, state):
-    """Wrap FLA kernel for single decode step (T=1)."""
-    o, ht = fused_recurrent_gated_delta_rule_fwd(
-        q=q, k=k, v=v, g=g, beta=beta,
-        scale=1.0,
-        initial_state=state,
-        output_final_state=True,
-    )
-    return o, ht
-
-
-def get_fla_inputs():
-    B, T, H, K, V = 1, 1, NUM_HEADS, DK, DV
-    HV = H  # no GVA, HV == H
-    return dict(
-        q=torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16),
-        k=torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16),
-        v=torch.randn(B, T, HV, V, device="cuda", dtype=torch.bfloat16),
-        g=torch.randn(B, T, HV, device="cuda", dtype=torch.bfloat16) * 0.1,
-        beta=torch.rand(B, T, HV, device="cuda", dtype=torch.bfloat16),
-        state=torch.zeros(B, HV, K, V, device="cuda", dtype=torch.float32),
-    )
-
-
-def benchmark_fn(fn, kwargs, warmup=100, repeat=1000):
-    for _ in range(warmup):
-        fn(**kwargs)
-    torch.cuda.synchronize()
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-
-    start.record()
-    for _ in range(repeat):
-        fn(**kwargs)
-    end.record()
-    torch.cuda.synchronize()
-
-    return start.elapsed_time(end) / repeat * 1000  # microseconds
-
-
-if __name__ == "__main__":
-    torch.manual_seed(42)
-
-    print("=" * 60)
-    print("FLA Gated DeltaNet Recurrent Kernel Benchmark")
-    print(f"B=1, T=1 (decode), H={NUM_HEADS}, K={DK}, V={DV}")
-    print("=" * 60)
-
-    kwargs = get_fla_inputs()
-    us = benchmark_fn(fla_step, kwargs)
-    print(f"\nFLA kernel latency: {us:.2f} us")

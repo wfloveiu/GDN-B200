@@ -31,37 +31,20 @@ def _run_cmd(cmd: list[str]):
 
 
 @app.function(image=image, gpu="B200", timeout=60 * 60)
-def run_fla_recurrent():
-    """FLA gated delta-rule recurrent kernel benchmark."""
-    _run_cmd(["python", "FLA_recurrent.py"])
-
-
-@app.function(image=image, gpu="B200", timeout=60 * 60)
-def run_recurrent():
-    """Custom Triton DeltaNet recurrent kernel (tiled v2) validation."""
-    _run_cmd(["python", "recurrent.py"])
-
-
-@app.function(image=image, gpu="B200", timeout=60 * 60)
-def run_cuda():
-    """CUDA kernel vs Triton kernel comparison."""
-    _run_cmd(["python", "deltanet_recurrent_cuda.py"])
+def run_bench():
+    _run_cmd(["python", "bench.py"])
 
 
 @app.function(image=image, gpu="B200", timeout=60 * 60)
 def run_all():
-    """Run all three kernels sequentially."""
-    _run_cmd(["python", "FLA_recurrent.py"])
-    _run_cmd(["python", "recurrent.py"])
-    _run_cmd(["python", "deltanet_recurrent_cuda.py"])
+    """Run all kernels sequentially."""
+    _run_cmd(["python", "bench.py"])
 
 
 @app.local_entrypoint()
 def main(which: str = "all"):
     dispatch = {
-        "fla": run_fla_recurrent,
-        "recurrent": run_recurrent,
-        "cuda": run_cuda,
+        "bench": run_bench,
         "all": run_all,
     }
     fn = dispatch.get(which)

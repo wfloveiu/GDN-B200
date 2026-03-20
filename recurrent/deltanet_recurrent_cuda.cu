@@ -1,20 +1,33 @@
 /*
- * Fused DeltaNet Recurrent State Update - CUDA Single-Pass Kernel
+ * Fused DeltaNet Recurrent State Update - CUDA Warp-Cooperative Kernel
+ *
+ * Fully fused: raw gate parameters (A_log, a, dt_bias, b) are computed
+ * inside the kernel — zero host-side PyTorch overhead.
  *
  * DeltaNet linear attention recurrence (per head, per decode step):
- *     S *= exp(g)                     // gate decay
- *     residual = v - S^T @ k          // delta rule residual
+ *     x = a + dt_bias
+ *     log_decay = -exp(A_log) * softplus(x)
+ *     decay = exp(log_decay)
+ *     beta = sigmoid(b)
+ *
+ *     S *= decay                          // gate decay
+ *     residual = v - S^T @ k              // delta rule residual
  *     delta = beta * residual
- *     S += outer(k, delta)            // rank-1 state update
- *     o = S^T @ q                     // output query
+ *     S += outer(delta, k)                // rank-1 state update
+ *     o = S^T @ q                         // output query
  *
- * Key optimization vs Triton 2-pass version:
- *   - Single pass: state loaded to SMEM once, all ops done in-place, written back once
- *   - Explicit shared memory: state fully resident in dynamic SMEM (67KB fp32)
- *   - No L2 cache dependency between passes
+ * State layout: [B, HV, V, K] (k-last, K contiguous) — f32
  *
- * Grid: (num_heads, B)
- * Block: DV threads (128), each thread owns one column of S[DK, DV]
+ * Warp-cooperative design:
+ *   - 1 block = 1 warp = 32 threads
+ *   - Each block handles BV v-rows (BV=4)
+ *   - Each thread handles BV * (K/32) = 4 * 4 = 16 f32 state elements
+ *   - Reductions (dot products) use __shfl_xor_sync warp shuffles
+ *   - q, k vectors in shared memory (256 f32 = 1KB)
+ *   - No __syncthreads needed — single warp guarantees lockstep
+ *
+ * Grid: (NV, B * HV) where NV = V / BV
+ * Block: 32 threads (1 warp)
  */
 
 #include <torch/extension.h>
@@ -22,176 +35,229 @@
 #include <cuda_bf16.h>
 #include <cmath>
 
-// Fixed dimensions for this model configuration
-constexpr int DK = 128;
-constexpr int DV = 128;
-constexpr int BLOCK_SIZE = DV;  // 128 threads = one per column
+// Compile-time dimensions
+constexpr int K_DIM = 128;    // full K dimension
+constexpr int V_DIM = 128;    // full V dimension
+constexpr int WARP_SIZE = 32; // threads per warp
+constexpr int BV = 16;         // v-rows per block
+constexpr int KPT = K_DIM / WARP_SIZE;  // K elements Per Thread = 4
 
-// Dynamic shared memory layout (all float32):
-//   [0, DK*DV)          : s_state[DK][DV]  (64KB)
-//   [DK*DV, DK*DV+DK)   : s_k[DK]          (512B)
-//   [DK*DV+DK, ...)      : s_q[DK]          (512B)
-//   [DK*DV+2*DK, ...)    : s_delta[DV]      (512B)
+__device__ __forceinline__ float softplus_f(float x) {
+    return (x > 20.0f) ? x : __logf(1.0f + __expf(x));
+}
+
+__device__ __forceinline__ float sigmoid_f(float x) {
+    return 1.0f / (1.0f + __expf(-x));
+}
+
+// Full warp reduction: sum across 32 lanes
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
 
 __global__ void deltanet_recurrent_kernel(
-    const __nv_bfloat16* __restrict__ Q,     // [B, H, DK]
-    const __nv_bfloat16* __restrict__ K,     // [B, H, DK]
-    const __nv_bfloat16* __restrict__ V,     // [B, H, DV]
-    const __nv_bfloat16* __restrict__ Beta,  // [B, H]
-    const __nv_bfloat16* __restrict__ Gate,  // [B, H]
-    __nv_bfloat16* __restrict__ S,           // [B, H, DK, DV] in-place
-    __nv_bfloat16* __restrict__ O,           // [B, H, DV]
-    int stride_sb, int stride_sh,
-    int stride_qb, int stride_qh,
-    int stride_kb, int stride_kh,
-    int stride_vb, int stride_vh,
-    int stride_ob, int stride_oh,
-    int stride_betab, int stride_betah,
-    int stride_gb, int stride_gh
+    // Input vectors
+    const __nv_bfloat16* __restrict__ Q,       // [B, 1, H, K]   bf16
+    const __nv_bfloat16* __restrict__ K_in,    // [B, 1, H, K]   bf16
+    const __nv_bfloat16* __restrict__ V_in,    // [B, 1, HV, V]  bf16
+    // Raw gate parameters
+    const float* __restrict__ A_log,           // [HV]           f32
+    const __nv_bfloat16* __restrict__ A,       // [B, 1, HV]     bf16
+    const float* __restrict__ Dt_bias,         // [HV]           f32
+    const __nv_bfloat16* __restrict__ B_gate,  // [B, 1, HV]     bf16
+    // State
+    const float* __restrict__ S,               // [B, HV, V, K]  f32 input
+    float* __restrict__ New_S,                 // [B, HV, V, K]  f32 output
+    // Output
+    __nv_bfloat16* __restrict__ O,             // [B, 1, HV, V]  bf16
+    float scale,
+    int H,
+    int HV
 ) {
-    const int head_id = blockIdx.x;
-    const int batch_id = blockIdx.y;
-    const int col = threadIdx.x;
+    // Grid: (NV, B * HV)
+    const int i_v = blockIdx.x;                    // which V-block
+    const int bh = blockIdx.y;                     // batch_id * HV + v_head_id
+    const int batch_id = bh / HV;
+    const int v_head_id = bh % HV;
+    const int head_id = v_head_id / (HV / H);     // GQA mapping
 
-    if (col >= DV) return;
+    const int tid = threadIdx.x;  // 0..31
 
-    // Dynamic shared memory pointers
-    extern __shared__ float smem[];
-    float* s_state = smem;                          // [DK * DV]
-    float* s_k     = smem + DK * DV;                // [DK]
-    float* s_q     = smem + DK * DV + DK;           // [DK]
-    float* s_delta = smem + DK * DV + DK + DK;      // [DV]
+    // ===== In-kernel gate/beta computation (fused, all threads compute same scalar) =====
+    const float a_val = __bfloat162float(A[batch_id * HV + v_head_id]);
+    const float dt_bias_val = Dt_bias[v_head_id];
+    const float a_log_val = A_log[v_head_id];
+    const float b_val = __bfloat162float(B_gate[batch_id * HV + v_head_id]);
 
-    // Load scalar inputs
-    const float beta = __bfloat162float(
-        Beta[batch_id * stride_betab + head_id * stride_betah]);
-    const float gate = __bfloat162float(
-        Gate[batch_id * stride_gb + head_id * stride_gh]);
-    const float decay = expf(gate);
+    const float x = a_val + dt_bias_val;
+    const float sp = softplus_f(x);
+    const float log_decay = -__expf(a_log_val) * sp;
+    const float decay = __expf(log_decay);
+    const float beta = sigmoid_f(b_val);
 
-    // Base pointers for this (batch, head)
-    const __nv_bfloat16* s_base = S + batch_id * stride_sb + head_id * stride_sh;
-    __nv_bfloat16* s_out_base   = S + batch_id * stride_sb + head_id * stride_sh;
+    // ===== Load q[K] and k[K] into shared memory (cooperative) =====
+    __shared__ float s_q[K_DIM];
+    __shared__ float s_k[K_DIM];
 
-    // =========================================================================
-    // Step 1: Load state column into SMEM + apply decay
-    // Each thread loads its column (128 elements along DK)
-    // =========================================================================
+    const __nv_bfloat16* q_base = Q + batch_id * (H * K_DIM) + head_id * K_DIM;
+    const __nv_bfloat16* k_base = K_in + batch_id * (H * K_DIM) + head_id * K_DIM;
+
+    // 32 threads load 128 elements: 4 per thread, fully coalesced
     #pragma unroll
-    for (int r = 0; r < DK; r++) {
-        float val = __bfloat162float(s_base[r * DV + col]);
-        s_state[r * DV + col] = val * decay;
+    for (int i = 0; i < KPT; i++) {
+        const int idx = tid * KPT + i;
+        s_q[idx] = __bfloat162float(q_base[idx]) * scale;
+        s_k[idx] = __bfloat162float(k_base[idx]);
     }
+    // Single warp — no __syncthreads needed
 
-    // Cooperatively load k and q vectors (128 threads, 128 elements)
-    const __nv_bfloat16* k_base = K + batch_id * stride_kb + head_id * stride_kh;
-    const __nv_bfloat16* q_base = Q + batch_id * stride_qb + head_id * stride_qh;
+    // ===== State base pointers =====
+    const int s_head_offset = batch_id * (HV * V_DIM * K_DIM) + v_head_id * (V_DIM * K_DIM);
 
-    if (col < DK) {
-        s_k[col] = __bfloat162float(k_base[col]);
-        s_q[col] = __bfloat162float(q_base[col]);
-    }
+    // ===== Process BV v-rows, each thread handles KPT=4 K-elements per row =====
+    // Thread tid owns state elements at K-indices: [tid*KPT .. tid*KPT+KPT-1]
+    // for each of BV v-rows
 
-    // Load v value for this thread's column
-    const float v_col = __bfloat162float(
-        V[batch_id * stride_vb + head_id * stride_vh + col]);
+    float s_regs[BV][KPT];  // BV * KPT = 4 * 4 = 16 f32 registers per thread
 
-    __syncthreads();
+    // Load BV v-values (only threads 0..BV-1 have meaningful v_val initially,
+    // but we broadcast via shuffle)
+    float v_vals[BV];
 
-    // =========================================================================
-    // Step 2: Compute S^T @ k for this column
-    // stk[col] = sum_r(S[r][col] * k[r])  -- thread-local reduction, no sync
-    // =========================================================================
-    float stk = 0.0f;
     #pragma unroll
-    for (int r = 0; r < DK; r++) {
-        stk += s_state[r * DV + col] * s_k[r];
+    for (int r = 0; r < BV; r++) {
+        const int v_idx = i_v * BV + r;
+        if (v_idx < V_DIM) {
+            // Only one thread needs to load, then broadcast — but simpler: all threads load
+            // (it's a scalar, bf16 load is cheap)
+            v_vals[r] = __bfloat162float(V_in[batch_id * (HV * V_DIM) + v_head_id * V_DIM + v_idx]);
+        } else {
+            v_vals[r] = 0.0f;
+        }
     }
 
-    // =========================================================================
-    // Step 3: Compute delta = beta * (v - stk), broadcast via SMEM
-    // =========================================================================
-    float delta_val = beta * (v_col - stk);
-    s_delta[col] = delta_val;
-    __syncthreads();
-
-    // =========================================================================
-    // Step 4: Rank-1 update + Step 5: Compute S^T @ q (fused)
-    // =========================================================================
-    float output_val = 0.0f;
+    // Load state rows [BV][KPT] + apply decay
     #pragma unroll
-    for (int r = 0; r < DK; r++) {
-        s_state[r * DV + col] += s_k[r] * s_delta[col];
-        output_val += s_state[r * DV + col] * s_q[r];
+    for (int r = 0; r < BV; r++) {
+        const int v_idx = i_v * BV + r;
+        const float* s_row_base = S + s_head_offset + v_idx * K_DIM;
+        if (v_idx < V_DIM) {
+            #pragma unroll
+            for (int i = 0; i < KPT; i++) {
+                s_regs[r][i] = s_row_base[tid * KPT + i] * decay;  // ① Gate decay
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < KPT; i++) {
+                s_regs[r][i] = 0.0f;
+            }
+        }
     }
 
-    // =========================================================================
-    // Step 6: Write back state to HBM and store output
-    // =========================================================================
+    // ===== ②③④ Delta rule for each v-row =====
     #pragma unroll
-    for (int r = 0; r < DK; r++) {
-        s_out_base[r * DV + col] = __float2bfloat16(s_state[r * DV + col]);
+    for (int r = 0; r < BV; r++) {
+        // ② S^T @ k: partial dot product, then warp reduce
+        float partial_stk = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < KPT; i++) {
+            partial_stk += s_regs[r][i] * s_k[tid * KPT + i];
+        }
+        float stk = warp_reduce_sum(partial_stk);  // broadcast to all lanes
+
+        // ③ Delta rule: delta = beta * (v - stk)
+        float delta = beta * (v_vals[r] - stk);
+
+        // ④ Rank-1 update: s_row[j] += delta * k[j]
+        #pragma unroll
+        for (int i = 0; i < KPT; i++) {
+            s_regs[r][i] += delta * s_k[tid * KPT + i];
+        }
     }
 
-    O[batch_id * stride_ob + head_id * stride_oh + col] = __float2bfloat16(output_val);
+    // ===== Store updated state + compute output =====
+    #pragma unroll
+    for (int r = 0; r < BV; r++) {
+        const int v_idx = i_v * BV + r;
+        if (v_idx < V_DIM) {
+            // Store state row
+            float* new_s_row = New_S + s_head_offset + v_idx * K_DIM;
+            #pragma unroll
+            for (int i = 0; i < KPT; i++) {
+                new_s_row[tid * KPT + i] = s_regs[r][i];
+            }
+
+            // ⑤ Output: o = dot(s_row, q), partial then warp reduce
+            float partial_o = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < KPT; i++) {
+                partial_o += s_regs[r][i] * s_q[tid * KPT + i];
+            }
+            float o_val = warp_reduce_sum(partial_o);
+
+            // Only lane 0 writes output (all lanes have the value, but avoid duplicate writes)
+            if (tid == 0) {
+                O[batch_id * (HV * V_DIM) + v_head_id * V_DIM + v_idx] = __float2bfloat16(o_val);
+            }
+        }
+    }
 }
 
 
+// =============================================================================
 // PyTorch C++ extension interface
-torch::Tensor deltanet_recurrent_cuda_forward(
-    torch::Tensor q,
-    torch::Tensor k,
-    torch::Tensor v,
-    torch::Tensor beta,
-    torch::Tensor gate,
-    torch::Tensor state
+// =============================================================================
+std::vector<torch::Tensor> deltanet_recurrent_cuda_forward(
+    torch::Tensor q,          // [B, T, H, K]   bf16
+    torch::Tensor k,          // [B, T, H, K]   bf16
+    torch::Tensor v,          // [B, T, HV, V]  bf16
+    torch::Tensor state,      // [B, HV, V, K]  f32
+    torch::Tensor A_log,      // [HV]           f32
+    torch::Tensor a,          // [B, T, HV]     bf16
+    torch::Tensor dt_bias,    // [HV]           f32
+    torch::Tensor b,          // [B, T, HV]     bf16
+    float scale,
+    torch::Tensor output,     // [B, T, HV, V]  bf16 (pre-allocated)
+    torch::Tensor new_state   // [B, HV, V, K]  f32  (pre-allocated)
 ) {
     const int B = q.size(0);
-    const int H = q.size(1);
+    const int H = q.size(2);
+    const int HV = v.size(2);
+    const int V_val = v.size(3);
 
-    auto output = torch::empty({B, H, DV}, q.options());
+    const int NV = (V_val + BV - 1) / BV;
 
-    dim3 grid(H, B);
-    dim3 block(BLOCK_SIZE);
+    dim3 grid(NV, B * HV);
+    dim3 block(WARP_SIZE);  // 32 threads = 1 warp
 
-    // Dynamic shared memory: s_state[DK*DV] + s_k[DK] + s_q[DK] + s_delta[DV]
-    // = (128*128 + 128 + 128 + 128) * 4 = 67,072 bytes
-    size_t smem_size = (DK * DV + DK + DK + DV) * sizeof(float);
-
-    // H800 (SM90) supports up to 228KB dynamic SMEM per block.
-    // Must opt-in for >48KB.
-    static bool smem_configured = false;
-    if (!smem_configured) {
-        cudaFuncSetAttribute(
-            deltanet_recurrent_kernel,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem_size
-        );
-        smem_configured = true;
-    }
+    // Shared memory: s_q[128] + s_k[128] = 1024 bytes
+    size_t smem_size = 2 * K_DIM * sizeof(float);
 
     deltanet_recurrent_kernel<<<grid, block, smem_size>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(beta.data_ptr()),
-        reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr()),
-        reinterpret_cast<__nv_bfloat16*>(state.data_ptr()),
+        reinterpret_cast<const float*>(A_log.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(a.data_ptr()),
+        reinterpret_cast<const float*>(dt_bias.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(b.data_ptr()),
+        reinterpret_cast<const float*>(state.data_ptr()),
+        reinterpret_cast<float*>(new_state.data_ptr()),
         reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
-        state.stride(0), state.stride(1),
-        q.stride(0), q.stride(1),
-        k.stride(0), k.stride(1),
-        v.stride(0), v.stride(1),
-        output.stride(0), output.stride(1),
-        beta.stride(0), beta.stride(1),
-        gate.stride(0), gate.stride(1)
+        scale,
+        H,
+        HV
     );
 
-    return output;
+    return {output, new_state};
 }
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &deltanet_recurrent_cuda_forward,
-          "DeltaNet recurrent step CUDA forward (single-pass, dynamic SMEM)");
+          "DeltaNet recurrent step CUDA warp-cooperative forward (fused gate computation)");
 }
