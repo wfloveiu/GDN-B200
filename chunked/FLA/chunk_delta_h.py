@@ -27,7 +27,7 @@ from utils import (
         for num_stages in ([4, 3, 2] if check_shared_mem('ampere') else [2, 1])
         for BV in ([32, 64] if check_shared_mem('ada') else [32])
     ],
-    key=['H', 'K', 'V', 'BT', 'USE_EXP2', 'TRANSPOSE_STATE'],
+    key=['H', 'Hk', 'K', 'V', 'BT', 'USE_EXP2', 'TRANSPOSE_STATE'],
     use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
 )
@@ -46,6 +46,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     chunk_offsets,
     T,
     H: tl.constexpr,
+    Hk: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -61,6 +62,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
+    i_hk = i_h // (H // Hk)  # GQA: map v-head index to k-head index
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
@@ -91,7 +93,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     # calculate offset
     h += (boh * H + i_h).to(tl.int64) * K*V
     v += (bos * H + i_h).to(tl.int64) * V
-    k += (bos * H + i_h).to(tl.int64) * K
+    k += (bos * Hk + i_hk).to(tl.int64) * K
     w += (bos * H + i_h).to(tl.int64) * K
     if SAVE_NEW_VALUE:
         v_new += (bos * H + i_h).to(tl.int64) * V
@@ -263,28 +265,28 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
         b_v = b_v.to(k.dtype.element_ty)
 
-        p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (0, i_t * BT), (64, BT), (0, 1))
+        p_k = tl.make_block_ptr(k, (K, T), (1, Hk*K), (0, i_t * BT), (64, BT), (0, 1))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         if TRANSPOSE_STATE:
             b_h1 += tl.trans(tl.dot(b_k, b_v))
         else:
             b_h1 += tl.dot(b_k, b_v)
         if K > 64:
-            p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (64, i_t * BT), (64, BT), (0, 1))
+            p_k = tl.make_block_ptr(k, (K, T), (1, Hk*K), (64, i_t * BT), (64, BT), (0, 1))
             b_k = tl.load(p_k, boundary_check=(0, 1))
             if TRANSPOSE_STATE:
                 b_h2 += tl.trans(tl.dot(b_k, b_v))
             else:
                 b_h2 += tl.dot(b_k, b_v)
         if K > 128:
-            p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (128, i_t * BT), (64, BT), (0, 1))
+            p_k = tl.make_block_ptr(k, (K, T), (1, Hk*K), (128, i_t * BT), (64, BT), (0, 1))
             b_k = tl.load(p_k, boundary_check=(0, 1))
             if TRANSPOSE_STATE:
                 b_h3 += tl.trans(tl.dot(b_k, b_v))
             else:
                 b_h3 += tl.dot(b_k, b_v)
         if K > 192:
-            p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (192, i_t * BT), (64, BT), (0, 1))
+            p_k = tl.make_block_ptr(k, (K, T), (1, Hk*K), (192, i_t * BT), (64, BT), (0, 1))
             b_k = tl.load(p_k, boundary_check=(0, 1))
             if TRANSPOSE_STATE:
                 b_h4 += tl.trans(tl.dot(b_k, b_v))
@@ -333,9 +335,9 @@ def chunk_gated_delta_rule_fwd_h(
     use_exp2: bool = False,
     transpose_state_layout: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    B, T, H, K, V = *k.shape, u.shape[-1]
+    B, T, Hk, K = k.shape
+    H, V = u.shape[-2], u.shape[-1]
     BT = chunk_size
-
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     # N: the actual number of sequences in the batch with either equal or variable lengths
@@ -368,6 +370,7 @@ def chunk_gated_delta_rule_fwd_h(
         chunk_offsets=chunk_offsets,
         T=T,
         H=H,
+        Hk=Hk,
         K=K,
         V=V,
         BT=BT,

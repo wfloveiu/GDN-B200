@@ -17,7 +17,7 @@ from utils import prepare_chunk_indices, exp, autotune_cache_kwargs, check_share
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    key=['H', 'Hk', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -33,6 +33,7 @@ def recompute_w_u_fwd_kernel(
     chunk_indices,
     T,
     H: tl.constexpr,
+    Hk: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -43,6 +44,7 @@ def recompute_w_u_fwd_kernel(
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
+    i_hk = i_h // (H // Hk)
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
@@ -68,7 +70,7 @@ def recompute_w_u_fwd_kernel(
         b_g = exp(tl.load(p_g, boundary_check=(0,)))
 
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(k + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_k = tl.make_block_ptr(k + (bos*Hk + i_hk) * K, (T, K), (Hk*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         p_w = tl.make_block_ptr(w + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_kb = b_k * b_b[:, None]
@@ -87,7 +89,8 @@ def recompute_w_u_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    B, T, H, K, V = *k.shape, v.shape[-1]
+    B, T, Hk, K = k.shape
+    H, V = v.shape[-2], v.shape[-1]
     BT = A.shape[-1]
     BK = 64
     BV = 64
@@ -96,8 +99,8 @@ def recompute_w_u_fwd(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    w = torch.empty_like(k)
-    u = torch.empty_like(v)
+    w = k.new_empty(B, T, H, K)   # w has H (=HV) heads
+    u = torch.empty_like(v)        # u has H (=HV) heads
     recompute_w_u_fwd_kernel[(NT, B*H)](
         k=k,
         v=v,
@@ -110,6 +113,7 @@ def recompute_w_u_fwd(
         chunk_indices=chunk_indices,
         T=T,
         H=H,
+        Hk=Hk,
         K=K,
         V=V,
         BT=BT,

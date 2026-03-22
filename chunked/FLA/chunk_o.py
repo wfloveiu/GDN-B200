@@ -21,7 +21,7 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
         triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
         triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
     ],
-    key=['H', 'K', 'V', 'BT', 'TRANSPOSE_STATE'],
+    key=['H', 'Hk', 'K', 'V', 'BT', 'TRANSPOSE_STATE'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -38,6 +38,7 @@ def chunk_fwd_kernel_o(
     scale,
     T,
     H: tl.constexpr,
+    Hk: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -50,6 +51,7 @@ def chunk_fwd_kernel_o(
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
+    i_hk = i_h // (H // Hk)
 
     if IS_VARLEN:
         i_tg = i_t
@@ -63,8 +65,8 @@ def chunk_fwd_kernel_o(
         bos, eos = i_b * T, i_b * T + T
 
     # offset calculation
-    q += (bos * H + i_h) * K
-    k += (bos * H + i_h) * K
+    q += (bos * Hk + i_hk) * K
+    k += (bos * Hk + i_hk) * K
     v += (bos * H + i_h) * V
     o += (bos * H + i_h) * V
     h += (i_tg * H + i_h).to(tl.int64) * K*V
@@ -73,8 +75,8 @@ def chunk_fwd_kernel_o(
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_k = tl.make_block_ptr(k, (K, T), (1, H*K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
+        p_q = tl.make_block_ptr(q, (T, K), (Hk*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_k = tl.make_block_ptr(k, (K, T), (1, Hk*K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
         if TRANSPOSE_STATE:
             p_h = tl.make_block_ptr(h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0))
         else:
@@ -134,13 +136,14 @@ def chunk_fwd_o(
     chunk_indices: torch.LongTensor | None = None,
     transpose_state_layout: bool = False,
 ) -> torch.Tensor:
-    B, T, H, K, V = *q.shape, v.shape[-1]
+    B, T, Hk, K = q.shape
+    H, V = v.shape[-2], v.shape[-1]
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
-        scale = k.shape[-1] ** -0.5
+        scale = K ** -0.5
 
     o = torch.empty_like(v)
     def grid(meta): return (triton.cdiv(V, meta['BV']), NT, B * H)
@@ -157,6 +160,7 @@ def chunk_fwd_o(
         scale=scale,
         T=T,
         H=H,
+        Hk=Hk,
         K=K,
         V=V,
         BT=BT,
