@@ -12,8 +12,8 @@ from torch.utils.cpp_extension import load
 # JIT compile the CUDA kernel
 _cur_dir = os.path.dirname(os.path.abspath(__file__))
 _cuda_module = load(
-    name="deltanet_recurrent_cuda_ext",
-    sources=[os.path.join(_cur_dir, "deltanet_recurrent_cuda.cu")],
+    name="deltanet_recurrent_cuda_v1_ext",
+    sources=[os.path.join(_cur_dir, "deltanet_recurrent_cuda_v1.cu")],
     extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_90"],
     verbose=False,
 )

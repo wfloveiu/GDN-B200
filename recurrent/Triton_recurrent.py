@@ -34,6 +34,33 @@ def fast_exp(x):
     return tldevice.fast_expf(x.to(tl.float32))
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BV': 4}, num_warps=1, num_stages=1),
+        triton.Config({'BV': 4}, num_warps=1, num_stages=2),
+        triton.Config({'BV': 4}, num_warps=1, num_stages=3)
+        # triton.Config({'BV': 4}, num_warps=2, num_stages=1),
+        # triton.Config({'BV': 4}, num_warps=4, num_stages=1),
+        # triton.Config({'BV': 8}, num_warps=1, num_stages=1),
+        # triton.Config({'BV': 8}, num_warps=2, num_stages=1),
+        # triton.Config({'BV': 8}, num_warps=4, num_stages=1),
+        # triton.Config({'BV': 16}, num_warps=1, num_stages=1),
+        # triton.Config({'BV': 16}, num_warps=2, num_stages=1),
+        # triton.Config({'BV': 16}, num_warps=4, num_stages=1),
+        # triton.Config({'BV': 32}, num_warps=1, num_stages=1),
+        # triton.Config({'BV': 32}, num_warps=2, num_stages=1),
+        # triton.Config({'BV': 32}, num_warps=4, num_stages=1),
+        # triton.Config({'BV': 64}, num_warps=1, num_stages=1),
+        # triton.Config({'BV': 64}, num_warps=2, num_stages=1),
+        # triton.Config({'BV': 64}, num_warps=4, num_stages=1),
+        # triton.Config({'BV': 64}, num_warps=8, num_stages=1),
+        # triton.Config({'BV': 128}, num_warps=1, num_stages=1),
+        # triton.Config({'BV': 128}, num_warps=2, num_stages=1),
+        # triton.Config({'BV': 128}, num_warps=4, num_stages=1),
+        # triton.Config({'BV': 128}, num_warps=8, num_stages=1),
+    ],
+    key=['T', 'H', 'HV', 'K', 'V'],
+)
 @triton.jit
 def _deltanet_recurrent_v3_kernel(
     # Input vectors (per token, per head)
@@ -170,9 +197,10 @@ def kernel(
     # This eliminates ~55μs of PyTorch kernel launch overhead
 
     # Grid: V-blocks × heads parallelized
-    BV = min(8, triton.next_power_of_2(V))  # fixed BV, same strategy as FLA
-    NV = triton.cdiv(V, BV)
-    grid = (NV, B * HV)
+    # BV is determined by autotune, use a lambda grid to compute NV dynamically
+    def grid(META):
+        NV = triton.cdiv(V, META['BV'])
+        return (NV, B * HV)
 
     _deltanet_recurrent_v3_kernel[grid](
         q, k, v,
@@ -180,9 +208,6 @@ def kernel(
         state, new_state, output, scale,
         T, H, HV,
         K, V,
-        BV=BV,
-        num_warps=1,
-        num_stages=1,
     )
 
     return output, new_state
