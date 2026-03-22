@@ -1,10 +1,10 @@
 import torch
-from FLA_recurrent import kernel as fla_kernel
 from Triton_recurrent import kernel as qwen_kernel
 from Triton_recurrent import _deltanet_recurrent_v3_kernel as qwen_triton_kernel
 from CUDA_recurrent_v1 import kernel as cuda_kernel
 from CUDA_recurrent_v2 import kernel as cuda_v2_kernel
 from CUDA_recurrent_v3 import kernel as cuda_v3_kernel
+from cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
 import math
 import torch.nn.functional as F
 
@@ -119,42 +119,6 @@ def _print_diff(label, test_out, ref_out, test_st, ref_st):
     print(f"{'Mean absolute error':>28} {abs_diff_out.mean().item():>14.6f} {abs_diff_st.mean().item():>14.6f}")
     print(f"{'Max  relative error':>28} {rel_diff_out.max().item():>14.6f} {rel_diff_st.max().item():>14.6f}")
     print(f"{'Mean relative error':>28} {rel_diff_out.mean().item():>14.6f} {rel_diff_st.mean().item():>14.6f}")
-
-
-def fla_accuracy(batch_size=1):
-    """Compare fla_kernel vs ref() (PyTorch reference)."""
-    torch.manual_seed(42)
-    inputs = get_inputs(batch_size)
-    B, T, H, K = inputs["q"].shape
-    HV, V = inputs["v"].shape[2], inputs["v"].shape[3]
-
-    # --- Run ref (PyTorch reference) ---
-    ref_output, ref_state = ref(
-        inputs["q"], inputs["k"], inputs["v"],
-        inputs["state"].clone(),
-        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
-        inputs["scale"],
-    )
-
-    # --- Run fla_kernel ---
-    fla_output = torch.empty(B, T, HV, V, device="cuda", dtype=torch.bfloat16)
-    fla_state = torch.empty(B, HV, V, K, device="cuda", dtype=torch.float32)
-    fla_kernel(
-        inputs["q"], inputs["k"], inputs["v"],
-        inputs["state"].clone(),
-        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
-        inputs["scale"],
-        fla_output, fla_state,
-    )
-
-    _print_diff("FLA vs Ref",
-                fla_output.float(), ref_output.float(),
-                fla_state.float(), ref_state.float())
-
-    inputs["output"] = fla_output
-    inputs["new_state"] = fla_state
-    us = benchmark_fn(fla_kernel, inputs)
-    print(f"FLA kernel latency: {us:.2f} us")
 
 
 def qwen_accuracy(batch_size=1):
@@ -305,6 +269,76 @@ def cuda_v3_accuracy(batch_size=1):
     print(f"CUDA_V3 kernel latency: {us:.2f} us")
 
 
+def bench_cutedsl(batch_size):
+    """Benchmark CuTe DSL kernel — compile once, then benchmark pure compiled kernel calls."""
+    import cuda.bindings.driver as cuda_drv
+    from cutlass.cute.runtime import from_dlpack
+    from cutedsl_gdn import _get_compiled_kernel, SMALL_BATCH_THRESHOLD
+
+    torch.manual_seed(42)
+    B, T, H, K, V = batch_size, 1, NUM_KHEADS, DK, DV
+    HV = NUM_VHEADS
+    N = B
+
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, T, HV, V, device="cuda", dtype=torch.bfloat16)
+    a = torch.randn(B, T, HV, device="cuda", dtype=torch.bfloat16) * 0.1
+    b = torch.randn(B, T, HV, device="cuda", dtype=torch.bfloat16)
+    A_log = torch.randn(HV, device="cuda", dtype=torch.float32) * -1.0
+    dt_bias = torch.randn(HV, device="cuda", dtype=torch.float32) * 0.1
+    o = torch.empty(B, T, HV, V, device="cuda", dtype=torch.bfloat16)
+
+    # CuTe DSL state: [pool_size, HV, K, V], pool_size=N, indices=[0..N-1]
+    state = torch.zeros(N, HV, K, V, device="cuda", dtype=torch.float32)
+    indices = torch.arange(N, device="cuda", dtype=torch.int32)
+    cu_seqlens = torch.arange(N + 1, dtype=torch.int32, device="cuda")
+
+    use_small = N < SMALL_BATCH_THRESHOLD
+
+    # Trigger JIT compilation via high-level API
+    cutedsl_fused_sigmoid_gating_delta_rule_update(
+        A_log, dt_bias, q, k, v, a, b,
+        state, indices, scale=1.0, use_qk_l2norm_in_kernel=False,
+    )
+    torch.cuda.synchronize()
+
+    # Get the compiled kernel object
+    compiled = _get_compiled_kernel(N, H, HV, K, V, N, use_small, is_varlen_decode=False)
+
+    # Wrap torch tensors as CuTe tensors (once, outside the loop)
+    cu_t = from_dlpack(cu_seqlens, assumed_align=16)
+    q_t = from_dlpack(q, assumed_align=16)
+    k_t = from_dlpack(k, assumed_align=16)
+    v_t = from_dlpack(v, assumed_align=16)
+    a_t = from_dlpack(a, assumed_align=16)
+    b_t = from_dlpack(b, assumed_align=16)
+    A_log_t = from_dlpack(A_log, assumed_align=16)
+    dt_bias_t = from_dlpack(dt_bias, assumed_align=16)
+    h0_t = from_dlpack(state, assumed_align=16)
+    idx_t = from_dlpack(indices, assumed_align=16)
+    o_t = from_dlpack(o, assumed_align=16)
+
+    # Use the DEFAULT stream so CUDA Events can correctly measure timing
+    stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    # Warmup
+    for _ in range(100):
+        compiled(cu_t, q_t, k_t, v_t, a_t, b_t, A_log_t, dt_bias_t, h0_t, idx_t, o_t, stream)
+    torch.cuda.synchronize()
+
+    # Benchmark
+    repeat = 1000
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(repeat):
+        compiled(cu_t, q_t, k_t, v_t, a_t, b_t, A_log_t, dt_bias_t, h0_t, idx_t, o_t, stream)
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / repeat * 1000  # us
+
+
 def benchmark_fn(fn, kwargs, warmup=100, repeat=1000):
     for _ in range(warmup):
         fn(**kwargs)
@@ -347,22 +381,28 @@ def bench_kernel(kernel_fn, batch_size):
 if __name__ == "__main__":
     torch.manual_seed(42)
 
-    kernels = {
+    # Standard kernels (same interface)
+    std_kernels = {
         "Qwen(Triton)": qwen_kernel,
         "CUDA_V1":      cuda_kernel,
         "CUDA_V2":      cuda_v2_kernel,
         "CUDA_V3":      cuda_v3_kernel,
     }
-    kernel_names = list(kernels.keys())
+    # All kernel names including CuTe DSL
+    kernel_names = list(std_kernels.keys()) + ["CuTeDSL"]
 
     # Collect all results: {bs: {name: latency_us}}
     results = {}
     for bs in BATCH_SIZES:
         results[bs] = {}
-        for name, fn in kernels.items():
+        for name, fn in std_kernels.items():
             us = bench_kernel(fn, bs)
             results[bs][name] = us
             print(f"  B={bs:>4d}  {name:>14s}: {us:>8.2f} us", flush=True)
+        # CuTe DSL (different interface, separate bench function)
+        us = bench_cutedsl(bs)
+        results[bs]["CuTeDSL"] = us
+        print(f"  B={bs:>4d}  {'CuTeDSL':>14s}: {us:>8.2f} us", flush=True)
 
     # ===== Print summary table =====
     print()

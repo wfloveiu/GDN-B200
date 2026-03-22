@@ -9,20 +9,58 @@ from packaging import version
 from enum import Enum
 
 import torch
+import torch.nn.functional as F
 import triton
+import triton.language as tl
 import triton.language.extra.libdevice as tldevice
 
 
 device = "cuda"
 device_torch_lib = getattr(torch, device)
 
-exp = tldevice.fast_expf
-exp2 = tldevice.exp2
-log = tldevice.fast_logf
-log2 = tldevice.fast_log2f
+# ===================== Triton JIT exp/log ops =====================
+# These are the JIT-compiled versions used inside triton kernels (from fla.ops.utils.op)
+if os.environ.get('FLA_USE_FAST_OPS', '0') == '1':
+    @triton.jit
+    def exp(x): return tldevice.fast_expf(x.to(tl.float32))
+    @triton.jit
+    def exp2(x): return tldevice.exp2(x.to(tl.float32))
+    @triton.jit
+    def log(x): return tldevice.fast_logf(x.to(tl.float32))
+    @triton.jit
+    def log2(x): return tldevice.fast_log2f(x.to(tl.float32))
+else:
+    @triton.jit
+    def exp(x): return tl.exp(x.to(tl.float32))
+    @triton.jit
+    def exp2(x): return tl.math.exp2(x.to(tl.float32))
+    @triton.jit
+    def log(x): return tl.log(x.to(tl.float32))
+    @triton.jit
+    def log2(x): return tl.log2(x.to(tl.float32))
 
-IS_NVIDIA_HOPPER = True and ("NVIDIA H" in torch.cuda.get_device_name(0) or torch.cuda.get_device_capability()[0] >= 9)
+# ===================== Device detection flags =====================
+IS_NVIDIA = torch.cuda.is_available() and 'nvidia' in torch.cuda.get_device_name(0).lower()
+IS_NVIDIA_HOPPER = IS_NVIDIA and ("NVIDIA H" in torch.cuda.get_device_name(0) or torch.cuda.get_device_capability()[0] >= 9)
+IS_NVIDIA_BLACKWELL = IS_NVIDIA and torch.cuda.get_device_capability()[0] == 10
 USE_CUDA_GRAPH = True and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
+
+# ===================== TMA / Gather support =====================
+IS_TMA_SUPPORTED = (IS_NVIDIA and torch.cuda.get_device_capability(0)[0] >= 9) \
+    if torch.cuda.is_available() else False
+
+# Check if tl.gather is supported
+IS_GATHER_SUPPORTED = hasattr(tl, 'gather')
+
+# make_tensor_descriptor compatibility
+if hasattr(tl, '_experimental_make_tensor_descriptor'):
+    make_tensor_descriptor = tl._experimental_make_tensor_descriptor
+elif hasattr(tl, 'make_tensor_descriptor'):
+    make_tensor_descriptor = tl.make_tensor_descriptor
+else:
+    @triton.jit
+    def make_tensor_descriptor(base, shape, strides, block_shape, _builder=None):
+        return None
 
 
 FLA_CACHE_RESULTS = os.getenv("FLA_CACHE_RESULTS", "1") == "1"
@@ -107,9 +145,22 @@ def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor,
     chunk_size: int,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
 ) -> torch.LongTensor:
+    if cu_seqlens_cpu is not None:
+        indices = torch.cat([torch.arange(n, device=cu_seqlens.device)
+                            for n in triton.cdiv(prepare_lens(cu_seqlens_cpu), chunk_size).tolist()])
+        return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
     indices = torch.cat([torch.arange(n) for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()])
     return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
+
+
+@tensor_cache
+def prepare_chunk_offsets(
+    cu_seqlens: torch.LongTensor,
+    chunk_size: int,
+) -> torch.LongTensor:
+    return F.pad(triton.cdiv(prepare_lens(cu_seqlens), chunk_size), (1, 0), value=0).cumsum(-1)
 
 
 # @functools.cache

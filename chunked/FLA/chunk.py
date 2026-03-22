@@ -2,8 +2,13 @@ import warnings
 
 import torch
 
-from utils import prepare_chunk_indices
+from utils import prepare_chunk_indices, input_guard, autocast_custom_fwd
 from cumsum import chunk_local_cumsum
+from chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from solve_tril import solve_tril
+from wy_fast import recompute_w_u_fwd
+from chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from chunk_o import chunk_fwd_o
 
 
 def chunk_gated_delta_rule_fwd(
@@ -45,7 +50,6 @@ def chunk_gated_delta_rule_fwd(
         chunk_indices=chunk_indices,
     )
 
-
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
@@ -71,45 +75,6 @@ def chunk_gated_delta_rule_fwd(
     )
     return g, o, A, final_state, initial_state
 
-
-
-class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
-
-    @staticmethod
-    @input_guard
-    @autocast_custom_fwd
-    def forward(
-        ctx,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-        scale: float,
-        initial_state: torch.Tensor,
-        output_final_state: bool,
-        cu_seqlens: torch.LongTensor | None = None,
-        cu_seqlens_cpu: torch.LongTensor | None = None,
-        use_qk_l2norm_in_kernel: bool = False,
-        transpose_state_layout: bool = False,
-    ):
-        q_rstd, k_rstd = None, None
-
-        chunk_indices = prepare_chunk_indices(cu_seqlens, 64, cu_seqlens_cpu=cu_seqlens_cpu) if cu_seqlens is not None else None
-        g, o, A, final_state, initial_state = chunk_gated_delta_rule_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            transpose_state_layout=transpose_state_layout,
-        )
-        return o.to(q.dtype), final_state
 
 
 @torch.compiler.disable
@@ -209,18 +174,19 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        scale,
-        initial_state,
-        output_final_state,
-        cu_seqlens,
-        cu_seqlens_cpu,
-        use_qk_l2norm_in_kernel,
-        transpose_state_layout,
+
+    chunk_indices = prepare_chunk_indices(cu_seqlens, 64, cu_seqlens_cpu=cu_seqlens_cpu) if cu_seqlens is not None else None
+    g, o, A, final_state, initial_state = chunk_gated_delta_rule_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        transpose_state_layout=transpose_state_layout,
     )
-    return o, final_state
+    return o.to(q.dtype), final_state
