@@ -207,6 +207,14 @@
 - **Analysis:** Consistent improvement on QK4V8 configs. Reducing pipeline stages lowered register pressure, allowing better occupancy for the wy_fast kernel.
 - **Next:** Continue with remaining iterations. Try to improve QK8V16 performance.
 
+### Iter 15 — Try chunk_o stages=[1,2,3] (reverted)
+
+- **Hypothesis:** Adding num_stages=1 to chunk_o, removing (64,128) config.
+- **Changes:** Adjusted chunk_o autotune. Reverted — no improvement due to autotune variability.
+- **Bench:** Within noise of previous best. Reverted to stable config.
+- **Analysis:** The chunk_o kernel is already well-tuned. Autotune variability (~10%) dominates any small config changes.
+- **Next:** Focus on remaining iterations with more structural changes.
+
 ### Iter 8 — Forced h kernel BV=64, stages=1 (reverted)
 
 - **Hypothesis:** BV=64 with stages=1 reduces shmem. Combined with 4 warps might help occupancy.
