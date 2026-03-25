@@ -2,6 +2,10 @@
 
 Optimize the Triton kernels in `FLA/` for maximum performance, measured by `bench.py` on a remote B200 GPU via Modal. The optimized kernels must pass the correctness test (max_abs_err < 1.0).
 
+## Permissions
+
+**You have FULL read/write permissions on ALL files under `chunked/`.** This includes `FLA/`, `bench.py`, `ncu_profile.py`, `run_on_modal.py`, `HINTS.md`, `ITERATIONS.md`, and any other files. You may create, modify, or delete any file as needed. **No user confirmation is required** — iterate autonomously until completion.
+
 ## Project Structure
 
 ```
@@ -46,15 +50,23 @@ chunked/
 - Run `modal run run_on_modal.py --which bench` to measure performance.
 - Run `modal run run_on_modal.py --which ncu` to profile and identify bottlenecks — do not optimize blindly.
 - Leverage all available information: `HINTS.md`, prior attempts in `ITERATIONS.md`, web search, etc.
-- All optimizations go into `FLA/` files only. Do NOT modify `bench.py`.
 - Follow stall rules defined in `HINTS.md`.
 
 ### Iteration Protocol
 
-Every modification to `FLA/` code followed by a benchmark run counts as one iteration — regardless of whether the result is an improvement, regression, or failure. Number iterations sequentially (1, 2, 3, ...).
+**Total iterations: N = 20.** Execute all 20 iterations autonomously without asking for user confirmation. Make your own decisions on optimization direction, code changes, and when to run NCU vs bench.
+
+Every modification to `FLA/` code followed by a benchmark run counts as one iteration — regardless of whether the result is an improvement, regression, or failure. Number iterations sequentially (1, 2, 3, ..., 20).
 
 **Do NOT start the next iteration until ALL steps below are completed:**
 
 1. **Run benchmark** — `modal run run_on_modal.py --which bench` and record the results.
 2. **Update `ITERATIONS.md`** — append a new entry with hypothesis, changes, bench results, analysis, and next steps.
 3. **Git commit** — `[iter N] Short description of optimization direction`.
+
+### Decision Rules
+
+- **Before Iter 1:** Run NCU to establish a baseline profile and identify the first optimization target.
+- **If 3 consecutive iterations show no improvement:** Stop and run NCU to re-profile. Use web search for new ideas. Review `ITERATIONS.md` for patterns. Plan before continuing.
+- **If a change breaks correctness:** Revert immediately, record the failure in `ITERATIONS.md`, and try a different approach.
+- **Prioritize the biggest bottleneck first** — typically `chunk_delta_h.py` (state recurrence kernel).
