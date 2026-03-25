@@ -133,6 +133,31 @@ def make_inputs(num_seqs, seq_len, num_q_heads=4, num_k_heads=4, num_v_heads=8,
 
 # ===================== Correctness test =====================
 
+def _report_errors(name, ref, tri):
+    """Report max abs/rel error with values at the error positions."""
+    ref_f, tri_f = ref.float(), tri.float()
+    diff = (ref_f - tri_f).abs()
+
+    # Max absolute error
+    abs_err_flat = diff.reshape(-1)
+    abs_idx = abs_err_flat.argmax().item()
+    max_abs_err = abs_err_flat[abs_idx].item()
+    ref_val_abs = ref_f.reshape(-1)[abs_idx].item()
+    tri_val_abs = tri_f.reshape(-1)[abs_idx].item()
+
+    # Max relative error
+    denom = torch.max(ref_f.abs(), tri_f.abs()).clamp(min=1e-8)
+    rel_err_flat = (diff / denom).reshape(-1)
+    rel_idx = rel_err_flat.argmax().item()
+    max_rel_err = rel_err_flat[rel_idx].item()
+    ref_val_rel = ref_f.reshape(-1)[rel_idx].item()
+    tri_val_rel = tri_f.reshape(-1)[rel_idx].item()
+
+    print(f"  {name:7s} | max_abs_err: {max_abs_err:.6f}  (ref={ref_val_abs:.6f}, tri={tri_val_abs:.6f})")
+    print(f"  {' ':7s} | max_rel_err: {max_rel_err:.6f}  (ref={ref_val_rel:.6f}, tri={tri_val_rel:.6f})")
+    return max_abs_err, max_rel_err
+
+
 @torch.no_grad()
 def test_correctness():
     """Compare chunk_gated_delta_rule against baseline_run on short sequences."""
@@ -146,23 +171,10 @@ def test_correctness():
     ref_out, ref_state = baseline_run(*args)
     tri_out, tri_state = chunk_gated_delta_rule(*args)
 
-    # Output comparison
-    ref_out_f, tri_out_f = ref_out.float(), tri_out.float()
-    out_abs_err = (ref_out_f - tri_out_f).abs().max().item()
-    out_denom = torch.max(ref_out_f.abs(), tri_out_f.abs())
-    out_rel_err = ((ref_out_f - tri_out_f).abs() / out_denom.clamp(min=1e-4)).max().item()
-    out_cos = F.cosine_similarity(ref_out_f.reshape(-1), tri_out_f.reshape(-1), dim=0).item()
+    out_abs, _ = _report_errors("Output", ref_out, tri_out)
+    st_abs, _ = _report_errors("State", ref_state, tri_state)
 
-    # State comparison
-    ref_state_f, tri_state_f = ref_state.float(), tri_state.float()
-    state_abs_err = (ref_state_f - tri_state_f).abs().max().item()
-    state_denom = torch.max(ref_state_f.abs(), tri_state_f.abs())
-    state_rel_err = ((ref_state_f - tri_state_f).abs() / state_denom.clamp(min=1e-4)).max().item()
-
-    print(f"  Output  | max_abs_err: {out_abs_err:.6f}  max_rel_err: {out_rel_err:.6f}  cosine_sim: {out_cos:.6f}")
-    print(f"  State   | max_abs_err: {state_abs_err:.6f}  max_rel_err: {state_rel_err:.6f}")
-
-    passed = out_cos > 0.95 and out_abs_err < 1.0
+    passed = out_abs < 1.0 and st_abs < 1.0
     status = "PASS" if passed else "FAIL"
     print(f"  Status  | {status}")
     print("=" * 70)
@@ -173,23 +185,24 @@ def test_correctness():
 
 def benchmark():
     """Benchmark chunk_gated_delta_rule with various configs."""
+    # (num_seqs, seq_len, num_q_heads, num_k_heads, num_v_heads)
     configs = [
-        # (num_seqs, seq_len)
-        # (4, 256),
-        # (4, 512),
-        # (4, 1024),
-        # (2, 2048),
-        (1, 4096),
+        (1, 8192,  4, 4, 8),
+        (4, 8192,  4, 4, 8),
+        (1, 65536, 4, 4, 8),
+        (1, 8192,  8, 8, 16),
+        (4, 8192,  8, 8, 16),
+        (1, 65536, 8, 8, 16),
     ]
     warmup = 5
     rep = 10
 
-    print("\n" + "=" * 80)
-    print(f"{'seqs':>5} {'seq_len':>8} {'total_T':>8} | {'Time (ms)':>10} {'Tokens/s (M)':>14}")
-    print("-" * 80)
+    print("\n" + "=" * 100)
+    print(f"{'seqs':>5} {'seq_len':>8} {'total_T':>8} {'QK_h':>5} {'V_h':>5} | {'Time (ms)':>10} {'Tokens/s (M)':>14}")
+    print("-" * 100)
 
-    for num_seqs, seq_len in configs:
-        args = make_inputs(num_seqs, seq_len)
+    for num_seqs, seq_len, nq, nk, nv in configs:
+        args = make_inputs(num_seqs, seq_len, num_q_heads=nq, num_k_heads=nk, num_v_heads=nv)
 
         fn = lambda: chunk_gated_delta_rule(*args)
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
@@ -197,9 +210,9 @@ def benchmark():
         total_T = num_seqs * seq_len
         tokens_per_sec = total_T / ms * 1e-3  # M tokens/s
 
-        print(f"{num_seqs:>5} {seq_len:>8} {total_T:>8} | {ms:>10.3f} {tokens_per_sec:>14.2f}")
+        print(f"{num_seqs:>5} {seq_len:>8} {total_T:>8} {nq:>5} {nv:>5} | {ms:>10.3f} {tokens_per_sec:>14.2f}")
 
-    print("=" * 80)
+    print("=" * 100)
 
 
 # ===================== Main =====================
