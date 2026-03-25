@@ -322,7 +322,17 @@
 - **Conclusion:** CS=128 benefits the h kernel but hurts everything else. The intra-chunk kernels (kkt, solve_tril, o) prefer smaller tile sizes for better register efficiency. **CS=64 remains optimal.**
 - **Code preserved:** BT=128 support in solve_tril kept for future reference. CHUNK_SIZE reverted to 64.
 - **Next:** The chunk_size exploration is complete: 16, 32, 64, 128 all tested. CS=64 is the Pareto-optimal choice. Focus on other optimization axes.
+```
+chunk_size=64 是帕累托最优，平衡了：
 
+h kernel 的串行循环次数（更大CS = 更少迭代 → 更快）
+intra-chunk kernel 的 tile 大小（更大CS = 更大tile → 更多寄存器 → 更慢）
+CS=128 的 h kernel 确实快了 27%（263µs vs 360µs），但 o kernel (+52%) 和 kkt (+130%) 的退步完全吞噬了收益
+
+CS ≤ 32 的瓶颈在 h kernel：循环次数翻倍/翻四倍直接导致严重退步
+
+solve_tril 已成功扩展支持 BT=128（三阶段方案），代码已保留供未来使用
+```
 <!-- Template — copy for each new iteration:
 
 ### Iter N — Short title
