@@ -141,6 +141,26 @@
 - **Analysis:** Mixed results. Short sequences benefit from fewer kernel launches and less HBM traffic. Long sequences (65536) regress — possibly due to higher register pressure in the fused kernel (holds 10+ BC×BC matrices simultaneously). The fused kernel replaces 3 separate kernels (kkt + phase1 + merge) with 1, but the monolithic approach may not autotune as well.
 - **Next:** Keep fused kernel for now. Try improving the long-sequence performance, perhaps by tuning the fused kernel autotune configs or falling back to separate kernels for long sequences.
 
+### Iter 10 — Widen fused kernel autotune (BK=32, num_warps=1)
+
+- **Hypothesis:** The upstream FLA uses BK=32 and num_warps=1 for the fused kernel. Adding these to autotune may find better configs, especially for long sequences.
+- **Changes:** `chunk_fwd_intra.py` — added BK=32 and num_warps=1 to autotune search.
+- **Bench:**
+  - Correct: True (PASS)
+  - Results:
+
+| Config | Baseline | Iter 6 | **Iter 10** | **Total Speedup** |
+|--------|----------|--------|-------------|-------------------|
+| 1×8192 QK4V8 | 0.529 | 0.395 | **0.347** | **1.52×** |
+| 4×8192 QK4V8 | 1.380 | 0.610 | **0.542** | **2.55×** |
+| 1×65536 QK4V8 | 4.301 | 2.492 | **2.477** | **1.74×** |
+| 1×8192 QK8V16 | 0.486 | 0.409 | **0.370** | **1.31×** |
+| 4×8192 QK8V16 | 1.226 | 0.895 | **0.789** | **1.55×** |
+| 1×65536 QK8V16 | 3.569 | 2.888 | **2.712** | **1.32×** |
+
+- **Analysis:** Significant improvement across all configs! The fused kernel with wider autotune now matches or beats the separate-kernel approach even on long sequences. The autotune likely chose smaller BK/warps for better register efficiency. This is our best result: **2.55× on 4×8192 QK4V8**.
+- **Next:** Continue optimizing. Run NCU to see new profile. Target remaining bottlenecks.
+
 ### Iter 8 — Forced h kernel BV=64, stages=1 (reverted)
 
 - **Hypothesis:** BV=64 with stages=1 reduces shmem. Combined with 4 warps might help occupancy.
