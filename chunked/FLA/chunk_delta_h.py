@@ -23,9 +23,9 @@ from utils import (
 @triton.autotune(
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [1, 2, 3, 4]
-        for BV in [32, 64, 128]
+        for num_warps in [2, 4]
+        for num_stages in [2, 3, 4]
+        for BV in [32, 64]
     ],
     key=['H', 'Hk', 'K', 'V', 'BT', 'USE_EXP2', 'TRANSPOSE_STATE'],
     use_cuda_graph=USE_CUDA_GRAPH,
@@ -349,10 +349,10 @@ def chunk_gated_delta_rule_fwd_h(
 
     if transpose_state_layout:
         h = k.new_empty(B, NT, H, V, K)
-        final_state = k.new_zeros(N, H, V, K, dtype=torch.float32) if output_final_state else None
+        final_state = k.new_empty(N, H, V, K, dtype=torch.float32) if output_final_state else None
     else:
         h = k.new_empty(B, NT, H, K, V)
-        final_state = k.new_zeros(N, H, K, V, dtype=torch.float32) if output_final_state else None
+        final_state = k.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
 
     v_new = torch.empty_like(u) if save_new_value else None
     def grid(meta): return (triton.cdiv(V, meta['BV']), N*H)

@@ -65,6 +65,16 @@
 - **Analysis:** No significant change. Autotune likely already converged on the best num_warps/stages. The bottleneck is likely structural (shmem usage, grid size) rather than tuning parameters.
 - **Next:** Run NCU post-iter1 to get updated profile. Focus on structural changes to h kernel.
 
+### Iter 3 — Tune h kernel (maxnreg + stages) and bf16 A matrix
+
+- **Hypothesis:** (a) `maxnreg=128` on h kernel could improve occupancy by trading register spill; (b) bfloat16 A matrix halves memory for KKT+solve_tril pipeline; (c) `num_stages=1` reduces shmem.
+- **Changes:** Tried `maxnreg` (reverted — regression), tried bf16 A matrix (reverted — mixed, some configs regressed). Kept autotune config with `num_stages=[2,3,4]` and `empty` instead of `zeros` for final_state.
+- **Bench:**
+  - Correct: True (PASS)
+  - Results: ~same as Iter 1/2 after reverts. `maxnreg` and bf16 A both caused regressions on some configs.
+- **Analysis:** The h kernel bottleneck is structural — limited by sequential time-loop and state size, not tuning params. bf16 A hurts precision-sensitive autotune paths. `new_empty` for final_state saves ~5µs (trivial).
+- **Next:** Focus on reducing total kernel count by fusing operations, or try `allow_tf32=True` in wy_fast dot products for speed.
+
 <!-- Template — copy for each new iteration:
 
 ### Iter N — Short title
