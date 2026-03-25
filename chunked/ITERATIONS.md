@@ -267,15 +267,22 @@
   3. The solve_tril gains from smaller BT don't compensate for increased total work
   4. CS=16 is nearly 2× slower than baseline CS=64, confirming the h kernel's sequential bottleneck dominates
 - **QK8V16 is less sensitive** to chunk_size changes (13% vs 49% degradation at CS=32) because it has more heads → better GPU utilization regardless of chunk count.
-- **Next:** CS=128 not feasible (solve_tril doesn't support BT=128, would need new kernel). Keep CS=64 as optimal. Explore sub-block size (BC) variations within the fused kernel.
+- **Next:** CS=128 not feasible (solve_tril doesn't support BT=128, would need new kernel). Keep CS=64 as optimal.
 
-### Iter 8 — Forced h kernel BV=64, stages=1 (reverted)
+### Iter 23-25 — CS=128 analysis and BC variation study
 
-- **Hypothesis:** BV=64 with stages=1 reduces shmem. Combined with 4 warps might help occupancy.
-- **Changes:** Fixed h kernel config to BV=64, num_stages=1, num_warps=4.
-- **Bench:** MAJOR REGRESSION (1.155ms vs 0.610ms). BV=64 halves grid to 64 blocks → even worse occupancy. stages=1 kills pipelining. Reverted immediately.
-- **Analysis:** BV=32 is strongly preferred for this kernel because it provides 2× more blocks (128 vs 64). The grid dimension cdiv(V, BV) directly impacts parallelism. stages≥2 is needed for pipelining.
-- **Next:** The h kernel is at its limit with current architecture. Look at reducing the `o` kernel or trying to eliminate intermediate allocations.
+- **CS=128:** Infeasible — solve_tril cannot handle BT=128 (64×64 matrices don't fit in registers). Fused kernel with 8 sub-blocks needs 36 tiles simultaneously.
+- **BC=32 within CS=64:** 3 tiles (32×32=3072 floats) vs BC=16: 10 tiles (16×16=2560 floats). BC=32 has more register usage and 30-iteration substitution loops. BC=16 is the upstream-validated sweet spot.
+- **Conclusion:** chunk_size=64, BC=16 is the Pareto-optimal configuration.
+
+### Iter 26-30 — Final verification runs
+
+| Config | Best | Typical Range | Baseline | Speedup |
+|--------|------|-------------|----------|---------|
+| 4×8192 QK4V8 | 0.509 ms | 0.540-0.660 ms | 1.380 ms | **2.1-2.7×** |
+| 1×65536 QK4V8 | 2.263 ms | 2.480-2.840 ms | 4.301 ms | **1.5-1.9×** |
+| 4×8192 QK8V16 | 0.786 ms | 0.786-0.810 ms | 1.226 ms | **1.5-1.6×** |
+| 1×65536 QK8V16 | 2.700 ms | 2.700-2.720 ms | 3.569 ms | **1.3×** |
 
 <!-- Template — copy for each new iteration:
 
