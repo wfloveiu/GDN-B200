@@ -243,6 +243,32 @@
 
 **Remaining bottleneck:** The `chunk_gated_delta_rule_fwd_kernel_h` (state recurrence) at ~360µs accounts for 45-60% of total time and is fundamentally limited by its sequential time-loop over chunks, high shared memory usage (78KB), and register pressure (142 regs/thread).
 
+## Chunk Size Exploration (Iter 21-30)
+
+### Iter 21 — Parameterize chunk_size, test CS=32 and CS=16
+
+- **Hypothesis:** Smaller chunk_size reduces per-chunk work (smaller A matrix, faster solve_tril) but increases total chunks → more h kernel iterations. Larger chunk_size does the opposite.
+- **Changes:** Refactored `chunk.py` to parameterize chunk_size. CS=64 uses fused kkt+solve kernel, other sizes fall back to separate kkt → solve_tril → wy pipeline. Fixed chunk_size propagation to all downstream kernels.
+- **Bench:**
+  - CS=64 PASS, CS=32 PASS, CS=16 PASS
+
+| Config | CS=64 (best) | CS=32 | CS=16 |
+|--------|-------------|-------|-------|
+| 1×8192 QK4V8 | 0.312 ms | 0.452 ms (+45%) | 0.592 ms (+90%) |
+| 4×8192 QK4V8 | 0.509 ms | 0.758 ms (+49%) | 0.865 ms (+70%) |
+| 1×65536 QK4V8 | 2.263 ms | 3.507 ms (+55%) | 4.504 ms (+99%) |
+| 1×8192 QK8V16 | 0.368 ms | 0.439 ms (+19%) | 0.648 ms (+76%) |
+| 4×8192 QK8V16 | 0.787 ms | 0.892 ms (+13%) | 1.188 ms (+51%) |
+| 1×65536 QK8V16 | 2.700 ms | 3.260 ms (+21%) | 4.950 ms (+83%) |
+
+- **Analysis:** **chunk_size=64 is optimal.** Smaller chunk sizes are uniformly worse because:
+  1. The h kernel's sequential loop doubles/quadruples with half/quarter chunk size
+  2. CS=32/16 uses the separate (non-fused) kkt+solve_tril pipeline → extra kernel launches + HBM round-trips
+  3. The solve_tril gains from smaller BT don't compensate for increased total work
+  4. CS=16 is nearly 2× slower than baseline CS=64, confirming the h kernel's sequential bottleneck dominates
+- **QK8V16 is less sensitive** to chunk_size changes (13% vs 49% degradation at CS=32) because it has more heads → better GPU utilization regardless of chunk count.
+- **Next:** CS=128 not feasible (solve_tril doesn't support BT=128, would need new kernel). Keep CS=64 as optimal. Explore sub-block size (BC) variations within the fused kernel.
+
 ### Iter 8 — Forced h kernel BV=64, stages=1 (reverted)
 
 - **Hypothesis:** BV=64 with stages=1 reduces shmem. Combined with 4 warps might help occupancy.
