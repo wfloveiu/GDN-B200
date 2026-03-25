@@ -12,7 +12,7 @@ _cur_dir = os.path.dirname(os.path.abspath(__file__))
 _cuda_module = load(
     name="deltanet_recurrent_cuda_v3_ext",
     sources=[os.path.join(_cur_dir, "deltanet_recurrent_cuda_v3.cu")],
-    extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_90"],
+    extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_100"],
     verbose=False,
 )
 

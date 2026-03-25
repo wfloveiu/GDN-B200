@@ -81,7 +81,7 @@ def run_ncu(batch_size: int = 128):
 
     ncu_cmd = [
         "ncu",
-        "--kernel-name", "deltanet_recurrent_v2_kernel",
+        "--kernel-name", "deltanet_recurrent_v3_kernel",
         "--launch-skip", "20",
         "--launch-count", "1",
         "--metrics", metrics,
@@ -93,7 +93,7 @@ def run_ncu(batch_size: int = 128):
 
     # --- Parse CSV and print formatted results ---
     print("\n" + "=" * 72)
-    print(f"  NCU Profiling Report: CUDA V2 DeltaNet Kernel (B={batch_size})")
+    print(f"  NCU Profiling Report: CUDA V3 DeltaNet Kernel (B={batch_size})")
     print("=" * 72)
 
     import csv

@@ -1,8 +1,8 @@
 """
-NCU profiling script for CUDA V2 DeltaNet recurrent kernel.
+NCU profiling script for CUDA V3 DeltaNet recurrent kernel.
 
 Usage (under ncu):
-    ncu --set full --kernel-name deltanet_recurrent_v2_kernel \
+    ncu --set full --kernel-name deltanet_recurrent_v3_kernel \
         --launch-skip 10 --launch-count 1 \
         --csv --page raw \
         python ncu_profile.py [batch_size]
@@ -12,10 +12,10 @@ Or standalone (just runs the kernel, useful for ncu wrapping):
 """
 import sys
 import torch
-from CUDA_recurrent_v2 import kernel as cuda_v2_kernel
+from CUDA_recurrent_v3 import kernel as cuda_v3_kernel
 
-NUM_KHEADS = 4
-NUM_VHEADS = 8
+NUM_KHEADS = 8
+NUM_VHEADS = 16
 DK = 128
 DV = 128
 
@@ -50,7 +50,7 @@ def main():
 
     # Warmup (ncu --launch-skip skips these)
     for _ in range(20):
-        cuda_v2_kernel(
+        cuda_v3_kernel(
             inputs["q"], inputs["k"], inputs["v"],
             inputs["state"].clone(),
             inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
@@ -60,7 +60,7 @@ def main():
     torch.cuda.synchronize()
 
     # Profiled launch
-    cuda_v2_kernel(
+    cuda_v3_kernel(
         inputs["q"], inputs["k"], inputs["v"],
         inputs["state"].clone(),
         inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
