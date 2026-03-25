@@ -284,6 +284,45 @@
 | 4×8192 QK8V16 | 0.786 ms | 0.786-0.810 ms | 1.226 ms | **1.5-1.6×** |
 | 1×65536 QK8V16 | 2.700 ms | 2.700-2.720 ms | 3.569 ms | **1.3×** |
 
+### Iter 22 — chunk_size=128 (Triton solve_tril BT=128)
+
+- **Hypothesis:** CS=128 halves the h kernel's sequential loop iterations (the biggest bottleneck at 360µs). The solve_tril can be extended to BT=128 with a 3-phase approach: solve 4×32×32 diagonal blocks → merge into 2×64×64 → merge into 128×128.
+- **Changes:**
+  - `solve_tril.py` — added `solve_tril_128x128_diag_kernel` (solves 4 diagonal 32×32 blocks), `merge_32x32_to_64x64_within_128_kernel` (merges to 2 diagonal 64×64), `merge_64x64_to_128x128_inverse_kernel` (final cross-block merge). Updated dispatch to support BT=128.
+  - `chunk.py` — parameterized CHUNK_SIZE, route CS=128 through separate kkt+solve_tril+wy_fast path (fused intra only supports CS=64).
+- **Bench:**
+  - Correct: True (PASS, max_abs_err=0.003906)
+  - Results:
+
+| Config | Best CS=64 | **CS=128** | Δ |
+|--------|-----------|-----------|---|
+| 1×8192 QK4V8 | 0.312 ms | 0.465 ms | +49% (slower) |
+| 4×8192 QK4V8 | 0.509 ms | 0.918 ms | +80% (slower) |
+| 1×65536 QK4V8 | 2.263 ms | 2.762 ms | +22% (slower) |
+| 1×8192 QK8V16 | 0.369 ms | 0.475 ms | +29% (slower) |
+| 4×8192 QK8V16 | 0.789 ms | 1.325 ms | +68% (slower) |
+| 1×65536 QK8V16 | 2.701 ms | 3.197 ms | +18% (slower) |
+
+- **NCU Profile (CS=128, 4×8192 QK4V8):**
+
+| Kernel | CS=64 Duration | CS=128 Duration | Change |
+|--------|---------------|----------------|--------|
+| h kernel | 360 µs | **263 µs** | **-27% ✓** |
+| o kernel | 161 µs | 245 µs | +52% ✗ |
+| solve_tril (3 phases) | 382 µs | 393 µs | ~same |
+| kkt (separate) | 53 µs | 122 µs | +130% ✗ |
+| wy_fast | 123 µs | 126 µs | ~same |
+| **Total** | **~1147 µs** | **~1223 µs** | **+6.6% ✗** |
+
+- **Analysis:** The h kernel DID improve by 27% (263 vs 360 µs) due to half the time-loop iterations. BUT:
+  1. **o kernel regressed 52%**: BT=128 tiles need 128×128 attention computation with 210 regs/thread → 12.5% occupancy
+  2. **kkt regressed 130%**: separate kkt kernel (not fused) + BT=128 tiles = 128×128 dot products with 255 regs
+  3. **solve_tril ~same**: 3-phase approach works but doesn't save time vs 2-phase CS=64
+  4. Net result: h kernel savings (-97µs) eaten by o kernel (+84µs) and kkt (+69µs) regressions
+- **Conclusion:** CS=128 benefits the h kernel but hurts everything else. The intra-chunk kernels (kkt, solve_tril, o) prefer smaller tile sizes for better register efficiency. **CS=64 remains optimal.**
+- **Code preserved:** BT=128 support in solve_tril kept for future reference. CHUNK_SIZE reverted to 64.
+- **Next:** The chunk_size exploration is complete: 16, 32, 64, 128 all tested. CS=64 is the Pareto-optimal choice. Focus on other optimization axes.
+
 <!-- Template — copy for each new iteration:
 
 ### Iter N — Short title
