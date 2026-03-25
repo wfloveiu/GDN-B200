@@ -121,6 +121,26 @@
 - **Analysis:** Diminishing returns on small kernels. The h kernel at 55% of total time is the hard bottleneck.
 - **Next:** Try reducing `o` kernel time by improving its memory access pattern, or try persistent kernel approach for h.
 
+### Iter 9 — Fused kkt + solve_tril kernel (from upstream FLA)
+
+- **Hypothesis:** Fusing chunk_scaled_dot_kkt + solve_tril into one kernel avoids HBM round-trip for intermediate A matrix. Upstream FLA has this optimization.
+- **Changes:** New `chunk_fwd_intra.py` with `chunk_gated_delta_rule_fwd_kkt_solve_kernel`. Updated `chunk.py` to use fused path.
+- **Bench:**
+  - Correct: True (PASS)
+  - Results:
+
+| Config | Iter 6 | Iter 9 | Δ |
+|--------|--------|--------|---|
+| 1×8192 QK4V8 | 0.395 | 0.362 | **-8.4%** |
+| 4×8192 QK4V8 | 0.610 | 0.620 | ~same |
+| 1×65536 QK4V8 | 2.492 | 2.763 | +10.9% regression |
+| 1×8192 QK8V16 | 0.409 | 0.399 | -2.4% |
+| 4×8192 QK8V16 | 0.895 | 0.903 | ~same |
+| 1×65536 QK8V16 | 2.888 | 2.945 | ~same |
+
+- **Analysis:** Mixed results. Short sequences benefit from fewer kernel launches and less HBM traffic. Long sequences (65536) regress — possibly due to higher register pressure in the fused kernel (holds 10+ BC×BC matrices simultaneously). The fused kernel replaces 3 separate kernels (kkt + phase1 + merge) with 1, but the monolithic approach may not autotune as well.
+- **Next:** Keep fused kernel for now. Try improving the long-sequence performance, perhaps by tuning the fused kernel autotune configs or falling back to separate kernels for long sequences.
+
 ### Iter 8 — Forced h kernel BV=64, stages=1 (reverted)
 
 - **Hypothesis:** BV=64 with stages=1 reduces shmem. Combined with 4 warps might help occupancy.

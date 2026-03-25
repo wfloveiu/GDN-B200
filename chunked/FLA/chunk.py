@@ -5,9 +5,7 @@ import torch.nn.functional as F
 
 from utils import prepare_chunk_indices, input_guard, autocast_custom_fwd
 from cumsum import chunk_local_cumsum
-from chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from solve_tril import solve_tril
-from wy_fast import recompute_w_u_fwd
+from chunk_fwd_intra import chunk_gated_delta_rule_fwd_intra
 from chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from chunk_o import chunk_fwd_o
 from fused_gdn_gating import fused_gdn_gating
@@ -26,27 +24,12 @@ def chunk_gated_delta_rule_fwd(
     transpose_state_layout: bool = False,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices)
-    # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k,
-        g=g,
-        beta=beta,
-        cu_seqlens=cu_seqlens,
-        output_dtype=torch.float32,
-        chunk_indices=chunk_indices,
-    )
-    A = solve_tril(
-        A=A,
-        cu_seqlens=cu_seqlens,
-        output_dtype=k.dtype,
-        chunk_indices=chunk_indices,
-    )
-    w, u = recompute_w_u_fwd(
+    # fused kkt + solve_tril + recompute_w_u (avoids HBM round-trip for A)
+    w, u, _ = chunk_gated_delta_rule_fwd_intra(
         k=k,
         v=v,
-        beta=beta,
-        A=A,
         g=g,
+        beta=beta,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
