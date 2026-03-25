@@ -215,6 +215,34 @@
 - **Analysis:** The chunk_o kernel is already well-tuned. Autotune variability (~10%) dominates any small config changes.
 - **Next:** Focus on remaining iterations with more structural changes.
 
+### Iter 16-20 — Final verification and summary
+
+- **Observation:** Remaining iterations focus on verification. The h kernel (state recurrence) at ~360µs is a fundamental sequential bottleneck that cannot be parallelized without algorithm changes. All other kernels have been significantly optimized.
+- **Autotune variability:** ~10-15% variation across Modal runs due to non-deterministic autotune. Best results are reproducible but not guaranteed on every run.
+
+## Final Summary
+
+**Best observed performance (vs baseline):**
+
+| Config | Baseline | Optimized | Speedup |
+|--------|----------|-----------|---------|
+| 1×8192 QK4V8 | 0.529 ms | 0.312 ms | **1.70×** |
+| 4×8192 QK4V8 | 1.380 ms | 0.509 ms | **2.71×** |
+| 1×65536 QK4V8 | 4.301 ms | 2.263 ms | **1.90×** |
+| 1×8192 QK8V16 | 0.486 ms | 0.368 ms | **1.32×** |
+| 4×8192 QK8V16 | 1.226 ms | 0.787 ms | **1.56×** |
+| 1×65536 QK8V16 | 3.569 ms | 2.700 ms | **1.32×** |
+
+**Key optimizations applied:**
+1. **Iter 1:** Split solve_tril 64×64 into two-phase (reduced 255 regs to ~70+123)
+2. **Iter 4:** Enable TF32 in wy_fast dot products
+3. **Iter 6:** Enable TF32 in solve_tril autotune
+4. **Iter 9-10:** Fused kkt + solve_tril kernel (from upstream FLA, eliminates HBM round-trip)
+5. **Iter 11:** BK=BV=128 for recompute_w_u (eliminates inner loops)
+6. **Iter 14:** Reduced wy_fast num_stages to [1,2] (lower register pressure)
+
+**Remaining bottleneck:** The `chunk_gated_delta_rule_fwd_kernel_h` (state recurrence) at ~360µs accounts for 45-60% of total time and is fundamentally limited by its sequential time-loop over chunks, high shared memory usage (78KB), and register pressure (142 regs/thread).
+
 ### Iter 8 — Forced h kernel BV=64, stages=1 (reverted)
 
 - **Hypothesis:** BV=64 with stages=1 reduces shmem. Combined with 4 warps might help occupancy.
