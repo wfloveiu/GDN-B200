@@ -113,6 +113,14 @@
 - **Analysis:** Consistent 2-4% improvement across all configs. TF32 allows the tensor cores to work faster on 16×16 matrix multiplies. The slight precision loss (0.004→0.008 max abs err) is acceptable.
 - **Next:** Look at the chunk_kkt kernel (47µs) — try adding TF32 autotune there too. Investigate if the `o` kernel can be improved.
 
+### Iter 7 — Refine kkt autotune configs
+
+- **Hypothesis:** Narrowing kkt autotune to BK=[64,128], adding num_stages=1 might find better config on B200.
+- **Changes:** `chunk_scaled_dot_kkt.py` — narrowed autotune search space.
+- **Bench:** ~same as Iter 6 (within noise). kkt is only 47µs (5% of total).
+- **Analysis:** Diminishing returns on small kernels. The h kernel at 55% of total time is the hard bottleneck.
+- **Next:** Try reducing `o` kernel time by improving its memory access pattern, or try persistent kernel approach for h.
+
 <!-- Template — copy for each new iteration:
 
 ### Iter N — Short title
