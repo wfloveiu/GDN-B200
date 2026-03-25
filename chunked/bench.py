@@ -175,14 +175,14 @@ def benchmark():
     """Benchmark chunk_gated_delta_rule with various configs."""
     configs = [
         # (num_seqs, seq_len)
-        (4, 256),
-        (4, 512),
-        (4, 1024),
-        (2, 2048),
+        # (4, 256),
+        # (4, 512),
+        # (4, 1024),
+        # (2, 2048),
         (1, 4096),
     ]
-    warmup = 25
-    rep = 100
+    warmup = 5
+    rep = 10
 
     print("\n" + "=" * 80)
     print(f"{'seqs':>5} {'seq_len':>8} {'total_T':>8} | {'Time (ms)':>10} {'Tokens/s (M)':>14}")
