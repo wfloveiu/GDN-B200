@@ -1,17 +1,23 @@
 /*
  * Fused DeltaNet Recurrent State Update - CUDA V3
  *
- * Optimized for B200 (Blackwell, SM 10.0):
+ * Best-of-breed design combining all proven optimizations:
  *   1. float4 (128-bit) vectorized state load/store
  *   2. uint2 (64-bit) vectorized q/k/v bf16 loads
- *   3. 4 warps per block, BV=4 v-rows per warp (16 total)
+ *   3. 4 warps per block — higher occupancy without smem overhead
  *   4. No shared memory, no __syncthreads — warps fully independent
- *   5. Each warp loads its own q/k into registers
- *   6. Grid: (V/(NUM_WARPS*BV), B*HV) = (8, B*HV)
- *   7. Fused output reduction with state store to reduce warp_reduce overhead
+ *   5. Each warp loads its own q/k into registers (256B bf16 = trivial)
+ *   6. Grid: (NV_BLOCKS, B*HV) — maximum block-level parallelism
+ *
+ * Why this wins:
+ *   - Small B (≤64): Low kernel launch overhead, float4 coalesced access
+ *   - Large B (≥128): 4 warps/block → 2x occupancy vs 1-warp,
+ *     better DRAM latency hiding without smem/sync overhead
+ *   - Pure register-based computation: no bank conflicts, no sync stalls
  *
  * State layout: [B, HV, V, K] (k-last, K contiguous) — f32
  *
+ * Grid: (V/(4*BV), B*HV) = (8, B*8)
  * Block: 128 threads (4 warps × 32 lanes)
  * Each warp: BV=4 v-rows, KPT=4 floats/thread
  */
@@ -83,8 +89,8 @@ __global__ void deltanet_recurrent_v3_kernel(
     const float beta = sigmoid_f(b_val);
 
     // ===== Load q, k per-warp via uint2 (64-bit) =====
-    const __nv_bfloat16* q_base = Q + (batch_id * H + head_id) * K_DIM;
-    const __nv_bfloat16* k_base = K_in + (batch_id * H + head_id) * K_DIM;
+    const __nv_bfloat16* q_base = Q + batch_id * (H * K_DIM) + head_id * K_DIM;
+    const __nv_bfloat16* k_base = K_in + batch_id * (H * K_DIM) + head_id * K_DIM;
 
     float r_q[KPT], r_k[KPT];
     {
@@ -105,7 +111,7 @@ __global__ void deltanet_recurrent_v3_kernel(
     }
 
     // ===== Pointers =====
-    const int s_head_offset = (batch_id * HV + v_head_id) * (V_DIM * K_DIM);
+    const int s_head_offset = batch_id * (HV * V_DIM * K_DIM) + v_head_id * (V_DIM * K_DIM);
     const int v_head_base = batch_id * (HV * V_DIM) + v_head_id * V_DIM;
     const int v_base = i_vb * BV_TOTAL + warp_id * BV;
 
@@ -115,65 +121,81 @@ __global__ void deltanet_recurrent_v3_kernel(
     #pragma unroll
     for (int r = 0; r < BV; r++) {
         const int v_idx = v_base + r;
-        const float4* s_row_f4 = reinterpret_cast<const float4*>(
-            S + s_head_offset + v_idx * K_DIM);
-        float4 tmp = s_row_f4[lane_id];
-        s_regs[r][0] = tmp.x * decay;
-        s_regs[r][1] = tmp.y * decay;
-        s_regs[r][2] = tmp.z * decay;
-        s_regs[r][3] = tmp.w * decay;
+        if (v_idx < V_DIM) {
+            const float4* s_row_f4 = reinterpret_cast<const float4*>(
+                S + s_head_offset + v_idx * K_DIM);
+            float4 tmp = s_row_f4[lane_id];
+            s_regs[r][0] = tmp.x * decay;
+            s_regs[r][1] = tmp.y * decay;
+            s_regs[r][2] = tmp.z * decay;
+            s_regs[r][3] = tmp.w * decay;
+        } else {
+            #pragma unroll
+            for (int i = 0; i < KPT; i++) s_regs[r][i] = 0.0f;
+        }
     }
 
     // ===== Load v via uint2 (64-bit) =====
     float v_vals[BV];
     {
-        const uint2* v_u2 = reinterpret_cast<const uint2*>(V_in + v_head_base + v_base);
-        uint2 v_packed = v_u2[0];
-        const __nv_bfloat162* v_bf2 = reinterpret_cast<const __nv_bfloat162*>(&v_packed);
-        v_vals[0] = __bfloat162float(v_bf2[0].x);
-        v_vals[1] = __bfloat162float(v_bf2[0].y);
-        v_vals[2] = __bfloat162float(v_bf2[1].x);
-        v_vals[3] = __bfloat162float(v_bf2[1].y);
+        const int vb_idx = v_head_base + v_base;
+        if (v_base + BV <= V_DIM) {
+            const uint2* v_u2 = reinterpret_cast<const uint2*>(V_in + vb_idx);
+            uint2 v_packed = v_u2[0];
+            const __nv_bfloat162* v_bf2 = reinterpret_cast<const __nv_bfloat162*>(&v_packed);
+            v_vals[0] = __bfloat162float(v_bf2[0].x);
+            v_vals[1] = __bfloat162float(v_bf2[0].y);
+            v_vals[2] = __bfloat162float(v_bf2[1].x);
+            v_vals[3] = __bfloat162float(v_bf2[1].y);
+        } else {
+            #pragma unroll
+            for (int r = 0; r < BV; r++) {
+                const int v_idx = v_base + r;
+                v_vals[r] = (v_idx < V_DIM)
+                    ? __bfloat162float(V_in[vb_idx + r]) : 0.0f;
+            }
+        }
     }
 
-    // ===== Delta rule + output + store (fused) =====
+    // ===== Delta rule =====
     #pragma unroll
     for (int r = 0; r < BV; r++) {
-        // Compute stk = k . s_row (dot product via warp reduction)
         float partial_stk = 0.0f;
         #pragma unroll
         for (int j = 0; j < KPT; j++) {
             partial_stk += s_regs[r][j] * r_k[j];
         }
         float stk = warp_reduce_sum(partial_stk);
-
-        // Delta update: s += beta * (v - stk) * k
         float delta = beta * (v_vals[r] - stk);
         #pragma unroll
         for (int j = 0; j < KPT; j++) {
             s_regs[r][j] += delta * r_k[j];
         }
+    }
 
-        // Store updated state via float4
+    // ===== Store state via float4 + compute output =====
+    #pragma unroll
+    for (int r = 0; r < BV; r++) {
         const int v_idx = v_base + r;
-        float4* dst_f4 = reinterpret_cast<float4*>(
-            New_S + s_head_offset + v_idx * K_DIM);
-        float4 out_f4;
-        out_f4.x = s_regs[r][0];
-        out_f4.y = s_regs[r][1];
-        out_f4.z = s_regs[r][2];
-        out_f4.w = s_regs[r][3];
-        dst_f4[lane_id] = out_f4;
+        if (v_idx < V_DIM) {
+            float4* dst_f4 = reinterpret_cast<float4*>(
+                New_S + s_head_offset + v_idx * K_DIM);
+            float4 out_f4;
+            out_f4.x = s_regs[r][0];
+            out_f4.y = s_regs[r][1];
+            out_f4.z = s_regs[r][2];
+            out_f4.w = s_regs[r][3];
+            dst_f4[lane_id] = out_f4;
 
-        // Compute output = q . s_row (dot product via warp reduction)
-        float partial_o = 0.0f;
-        #pragma unroll
-        for (int j = 0; j < KPT; j++) {
-            partial_o += s_regs[r][j] * r_q[j];
-        }
-        float o_val = warp_reduce_sum(partial_o);
-        if (lane_id == 0) {
-            O[v_head_base + v_idx] = __float2bfloat16(o_val);
+            float partial_o = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < KPT; j++) {
+                partial_o += s_regs[r][j] * r_q[j];
+            }
+            float o_val = warp_reduce_sum(partial_o);
+            if (lane_id == 0) {
+                O[v_head_base + v_idx] = __float2bfloat16(o_val);
+            }
         }
     }
 }
@@ -224,5 +246,5 @@ std::vector<torch::Tensor> deltanet_recurrent_cuda_v3_forward(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &deltanet_recurrent_cuda_v3_forward,
-          "DeltaNet recurrent step CUDA V3 forward");
+          "DeltaNet recurrent step CUDA V3 4-warp vectorized forward");
 }
