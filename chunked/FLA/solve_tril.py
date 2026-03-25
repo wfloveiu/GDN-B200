@@ -8,7 +8,7 @@ import triton.language as tl
 
 from utils import prepare_chunk_indices, make_tensor_descriptor, IS_TMA_SUPPORTED, autotune_cache_kwargs, input_guard
 
-FLA_TRIL_PRECISION = os.environ.get('FLA_TRIL_PRECISION', 'ieee')
+FLA_TRIL_PRECISION = os.environ.get('FLA_TRIL_PRECISION', 'tf32')
 assert FLA_TRIL_PRECISION in ['ieee', 'tf32', 'tf32x3'], \
     f"FLA_TRIL_PRECISION must be one of 'ieee', 'tf32', or 'tf32x3', but got {FLA_TRIL_PRECISION}"
 DOT_PRECISION_AUTOTUNE_LIST = ["ieee"] if not IS_TMA_SUPPORTED else list({"ieee", FLA_TRIL_PRECISION})

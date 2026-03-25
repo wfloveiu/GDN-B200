@@ -93,6 +93,26 @@
 - **Analysis:** The gating kernel is only 33µs (4% of total). Even 2× speedup saves only 16µs. Not worth the complexity. Focus on bigger targets.
 - **Next:** Try `input_precision='tf32'` in solve_tril dot products. Profile the o kernel more carefully.
 
+### Iter 6 — Enable TF32 precision in solve_tril autotune
+
+- **Hypothesis:** solve_tril's DOT_PRECISION was fixed to 'ieee' on B200 due to default env var. Adding 'tf32' to the autotune list lets the compiler use TF32 tensor cores for the 12+ dot products in the merge kernel.
+- **Changes:** `solve_tril.py` — changed `FLA_TRIL_PRECISION` default from 'ieee' to 'tf32', making autotune search over both 'ieee' and 'tf32' on TMA-capable GPUs.
+- **Bench:**
+  - Correct: True (PASS, max_abs_err=0.007812 — slightly higher but well under 1.0)
+  - Results:
+
+| Config | Iter 4 | Iter 6 | Δ |
+|--------|--------|--------|---|
+| 1×8192 QK4V8 | 0.408 | 0.395 | -3.2% |
+| 4×8192 QK4V8 | 0.638 | 0.610 | -4.4% |
+| 1×65536 QK4V8 | 2.552 | 2.492 | -2.4% |
+| 1×8192 QK8V16 | 0.422 | 0.409 | -3.1% |
+| 4×8192 QK8V16 | 0.915 | 0.895 | -2.2% |
+| 1×65536 QK8V16 | 2.938 | 2.888 | -1.7% |
+
+- **Analysis:** Consistent 2-4% improvement across all configs. TF32 allows the tensor cores to work faster on 16×16 matrix multiplies. The slight precision loss (0.004→0.008 max abs err) is acceptable.
+- **Next:** Look at the chunk_kkt kernel (47µs) — try adding TF32 autotune there too. Investigate if the `o` kernel can be improved.
+
 <!-- Template — copy for each new iteration:
 
 ### Iter N — Short title
