@@ -85,6 +85,14 @@
 - **Analysis:** The wy_fast kernel is only ~97µs (11% of total). TF32 may save a few µs but it's within measurement noise. However, no regression, so keep the change.
 - **Next:** Try fusing `fused_gdn_gating` inline or investigate chunk_size=32 to reduce solve_tril overhead.
 
+### Iter 5 — Attempted gdn_gating kernel rewrite and reverted
+
+- **Hypothesis:** The gdn_gating kernel launches 32768 tiny blocks (1 warp each). Vectorizing across tokens with larger blocks should reduce launch overhead and improve utilization.
+- **Changes:** Rewrote gdn_gating with BLOCK_T=1024, loop over heads. Reverted — sequential head loop was worse than original's embarrassingly parallel approach.
+- **Bench:** Slight regression on some configs. Reverted to original.
+- **Analysis:** The gating kernel is only 33µs (4% of total). Even 2× speedup saves only 16µs. Not worth the complexity. Focus on bigger targets.
+- **Next:** Try `input_precision='tf32'` in solve_tril dot products. Profile the o kernel more carefully.
+
 <!-- Template — copy for each new iteration:
 
 ### Iter N — Short title
