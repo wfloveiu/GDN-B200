@@ -23,9 +23,9 @@ from utils import (
 @triton.autotune(
     configs=[
         triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in ([4, 3, 2] if check_shared_mem('ampere') else [2, 1])
-        for BV in ([32, 64] if check_shared_mem('ada') else [32])
+        for num_warps in [2, 4, 8]
+        for num_stages in [1, 2, 3, 4]
+        for BV in [32, 64, 128]
     ],
     key=['H', 'Hk', 'K', 'V', 'BT', 'USE_EXP2', 'TRANSPOSE_STATE'],
     use_cuda_graph=USE_CUDA_GRAPH,

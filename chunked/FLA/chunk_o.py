@@ -17,9 +17,10 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 })
 @triton.autotune(
     configs=[
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
+        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK, BV in [(128, 128), (64, 64), (128, 64), (64, 128)]
+        for num_warps in [4, 8]
+        for num_stages in [2, 3, 4]
     ],
     key=['H', 'Hk', 'K', 'V', 'BT', 'TRANSPOSE_STATE'],
     **autotune_cache_kwargs,

@@ -45,6 +45,26 @@
 - **Analysis:** Huge win, especially on 4×8192 QK4V8 (2.14×). Register pressure reduction worked as expected. The two-phase approach trades 1 kernel launch for much better occupancy.
 - **Next:** Target the second bottleneck: `chunk_gated_delta_rule_fwd_kernel_h` (31.4% of time, 6.3% occupancy, 78KB shmem, grid < SMs).
 
+### Iter 2 — Expand autotune configs for h, o, and wy kernels
+
+- **Hypothesis:** Wider autotune search (BV=128, num_warps=8, num_stages=1 for h kernel; asymmetric BK/BV for o kernel) may find better configs on B200.
+- **Changes:** `chunk_delta_h.py` — added BV=128, num_warps=8, num_stages=1. `chunk_o.py` — added BK/BV asymmetric configs. `wy_fast.py` — added num_stages=1.
+- **Bench:**
+  - Correct: True (PASS)
+  - Results:
+
+| Config | Iter 1 | Iter 2 | Δ |
+|--------|--------|--------|---|
+| 1×8192 QK4V8 | 0.409 ms | 0.414 ms | ~same |
+| 4×8192 QK4V8 | 0.646 ms | 0.640 ms | ~same |
+| 1×65536 QK4V8 | 2.539 ms | 2.542 ms | ~same |
+| 1×8192 QK8V16 | 0.423 ms | 0.421 ms | ~same |
+| 4×8192 QK8V16 | 0.934 ms | 0.922 ms | ~same |
+| 1×65536 QK8V16 | 2.973 ms | 2.949 ms | ~same |
+
+- **Analysis:** No significant change. Autotune likely already converged on the best num_warps/stages. The bottleneck is likely structural (shmem usage, grid size) rather than tuning parameters.
+- **Next:** Run NCU post-iter1 to get updated profile. Focus on structural changes to h kernel.
+
 <!-- Template — copy for each new iteration:
 
 ### Iter N — Short title
