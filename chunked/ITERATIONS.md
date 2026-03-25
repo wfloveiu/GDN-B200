@@ -121,6 +121,14 @@
 - **Analysis:** Diminishing returns on small kernels. The h kernel at 55% of total time is the hard bottleneck.
 - **Next:** Try reducing `o` kernel time by improving its memory access pattern, or try persistent kernel approach for h.
 
+### Iter 8 — Forced h kernel BV=64, stages=1 (reverted)
+
+- **Hypothesis:** BV=64 with stages=1 reduces shmem. Combined with 4 warps might help occupancy.
+- **Changes:** Fixed h kernel config to BV=64, num_stages=1, num_warps=4.
+- **Bench:** MAJOR REGRESSION (1.155ms vs 0.610ms). BV=64 halves grid to 64 blocks → even worse occupancy. stages=1 kills pipelining. Reverted immediately.
+- **Analysis:** BV=32 is strongly preferred for this kernel because it provides 2× more blocks (128 vs 64). The grid dimension cdiv(V, BV) directly impacts parallelism. stages≥2 is needed for pipelining.
+- **Next:** The h kernel is at its limit with current architecture. Look at reducing the `o` kernel or trying to eliminate intermediate allocations.
+
 <!-- Template — copy for each new iteration:
 
 ### Iter N — Short title
