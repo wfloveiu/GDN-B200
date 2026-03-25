@@ -75,6 +75,16 @@
 - **Analysis:** The h kernel bottleneck is structural — limited by sequential time-loop and state size, not tuning params. bf16 A hurts precision-sensitive autotune paths. `new_empty` for final_state saves ~5µs (trivial).
 - **Next:** Focus on reducing total kernel count by fusing operations, or try `allow_tf32=True` in wy_fast dot products for speed.
 
+### Iter 4 — Enable TF32 in wy_fast dot product
+
+- **Hypothesis:** The wy_fast kernel uses `allow_tf32=False`, forcing IEEE precision. Removing this constraint lets the compiler use TF32 tensor cores on B200, which are ~2× faster for matrix multiply.
+- **Changes:** `wy_fast.py` — removed `allow_tf32=False` from `tl.dot(b_A, b_vb)`.
+- **Bench:**
+  - Correct: True (PASS, state max_abs_err=0.005 still well under 1.0)
+  - Results: ~same as Iter 1/2 (within noise). TF32 didn't measurably change wy_fast timing since it's not the bottleneck.
+- **Analysis:** The wy_fast kernel is only ~97µs (11% of total). TF32 may save a few µs but it's within measurement noise. However, no regression, so keep the change.
+- **Next:** Try fusing `fused_gdn_gating` inline or investigate chunk_size=32 to reduce solve_tril overhead.
+
 <!-- Template — copy for each new iteration:
 
 ### Iter N — Short title
