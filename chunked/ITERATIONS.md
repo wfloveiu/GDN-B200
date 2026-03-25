@@ -179,6 +179,14 @@
 - **Analysis:** The previous autotune configs were already well-tuned for chunk_o. Adding too many options can cause autotune to pick locally suboptimal configs. Stick with previous settings.
 - **Next:** Try other approaches — investigate if we can reduce memory traffic by using smaller intermediate types.
 
+### Iter 13 — Verification run
+
+- **Hypothesis:** Verify performance stability across runs.
+- **Changes:** None (verification of iter 11 code).
+- **Bench:** Results: 0.353/0.589/2.586 for QK4V8, 0.369/0.787/2.705 for QK8V16. Some variability due to autotune non-determinism across Modal runs.
+- **Analysis:** Autotune variability is ~10% across runs. The best observed results remain: 0.311/0.517/2.306 for QK4V8 (2.67× speedup). The h kernel dominates at ~60-70% and is fundamentally limited by sequential time-loop.
+- **Next:** We've achieved strong results. Focus remaining iterations on reducing variability and trying to squeeze more from non-h kernels.
+
 ### Iter 8 — Forced h kernel BV=64, stages=1 (reverted)
 
 - **Hypothesis:** BV=64 with stages=1 reduces shmem. Combined with 4 warps might help occupancy.
