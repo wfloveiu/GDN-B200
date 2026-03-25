@@ -171,6 +171,14 @@
 - **Analysis:** Eliminating inner loops dramatically reduced the w_u kernel time. Single-iteration K/V loops reduce register spill and branch overhead.
 - **Next:** Continue optimizing chunk_fwd_kernel_o and explore other improvements.
 
+### Iter 12 — Wider chunk_o autotune (reverted)
+
+- **Hypothesis:** Adding num_stages=1 and num_warps=2 to chunk_o autotune may find better configs.
+- **Changes:** Added wider search space. Reverted — regression on QK4V8 configs (autotune picked worse configs).
+- **Bench:** 0.366/0.621 vs 0.311/0.541 on QK4V8 1×8192/4×8192. Reverted.
+- **Analysis:** The previous autotune configs were already well-tuned for chunk_o. Adding too many options can cause autotune to pick locally suboptimal configs. Stick with previous settings.
+- **Next:** Try other approaches — investigate if we can reduce memory traffic by using smaller intermediate types.
+
 ### Iter 8 — Forced h kernel BV=64, stages=1 (reverted)
 
 - **Hypothesis:** BV=64 with stages=1 reduces shmem. Combined with 4 warps might help occupancy.
