@@ -92,8 +92,8 @@ def recompute_w_u_fwd(
     B, T, Hk, K = k.shape
     H, V = v.shape[-2], v.shape[-1]
     BT = A.shape[-1]
-    BK = 64
-    BV = 64
+    BK = min(K, 128)
+    BV = min(V, 128)
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)

@@ -161,6 +161,16 @@
 - **Analysis:** Significant improvement across all configs! The fused kernel with wider autotune now matches or beats the separate-kernel approach even on long sequences. The autotune likely chose smaller BK/warps for better register efficiency. This is our best result: **2.55× on 4×8192 QK4V8**.
 - **Next:** Continue optimizing. Run NCU to see new profile. Target remaining bottlenecks.
 
+### Iter 11 — BK=BV=128 for recompute_w_u_fwd
+
+- **Hypothesis:** With K=V=128, using BK=BV=128 eliminates inner loops (1 iteration vs 2 with BK=64). This reduces loop overhead and register pressure from keeping multiple tile pointers alive.
+- **Changes:** `wy_fast.py` — changed BK=min(K,128), BV=min(V,128).
+- **Bench:**
+  - Correct: True (PASS)
+  - Best results yet: **2.67× on 4×8192 QK4V8**, **1.87× on 1×65536 QK4V8**
+- **Analysis:** Eliminating inner loops dramatically reduced the w_u kernel time. Single-iteration K/V loops reduce register spill and branch overhead.
+- **Next:** Continue optimizing chunk_fwd_kernel_o and explore other improvements.
+
 ### Iter 8 — Forced h kernel BV=64, stages=1 (reverted)
 
 - **Hypothesis:** BV=64 with stages=1 reduces shmem. Combined with 4 warps might help occupancy.
