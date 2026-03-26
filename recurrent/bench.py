@@ -1,6 +1,6 @@
 import torch
 from Triton_recurrent import kernel as qwen_kernel
-from CUDA_recurrent_v3 import kernel as cuda_v3_kernel
+from CUDA_recurrent import kernel as cuda_kernel
 from cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
 import math
 import torch.nn.functional as F
@@ -214,7 +214,7 @@ if __name__ == "__main__":
     # Kernels to benchmark
     std_kernels = {
         "Qwen(Triton)": qwen_kernel,
-        "CUDA_V3":      cuda_v3_kernel,
+        "CUDA":      cuda_kernel,
     }
     kernel_names = list(std_kernels.keys()) + ["CuTeDSL"]
 
@@ -242,7 +242,7 @@ if __name__ == "__main__":
     header = f"{'Batch':>6}"
     for name in kernel_names:
         header += f" | {name:>{col_w}}"
-    header += f" | {'V3 vs Qwen':>{col_w}}"
+    header += f" | {'CUDA vs Qwen':>{col_w}}"
     print(header)
     print("-" * len(header))
 
@@ -252,9 +252,9 @@ if __name__ == "__main__":
         for name in kernel_names:
             us = results[bs][name]
             row += f" | {us:>{col_w}.2f}"
-        # V3 vs Qwen speedup
+        # CUDA vs Qwen speedup
         qwen_us = results[bs]["Qwen(Triton)"]
-        v3_us = results[bs]["CUDA_V3"]
+        v3_us = results[bs]["CUDA"]
         speedup = qwen_us / v3_us
         if speedup >= 1.0:
             tag = f"{speedup:.1f}x faster"

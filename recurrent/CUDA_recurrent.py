@@ -1,7 +1,7 @@
 """
-DeltaNet Recurrent Step - CUDA V3 multi-warp pipelined kernel wrapper.
+DeltaNet Recurrent Step - CUDA kernel wrapper.
 
-V3: 4 warps per block + cp.async prefetch + float4 vectorized access.
+4 warps per block + float4 vectorized state access + fused gating.
 """
 import os
 import math
@@ -10,8 +10,8 @@ from torch.utils.cpp_extension import load
 
 _cur_dir = os.path.dirname(os.path.abspath(__file__))
 _cuda_module = load(
-    name="deltanet_recurrent_cuda_v3_ext",
-    sources=[os.path.join(_cur_dir, "deltanet_recurrent_cuda_v3.cu")],
+    name="deltanet_recurrent_cuda_ext",
+    sources=[os.path.join(_cur_dir, "deltanet_recurrent_cuda.cu")],
     extra_cuda_cflags=["-O3", "--use_fast_math", "-arch=sm_100"],
     verbose=False,
 )

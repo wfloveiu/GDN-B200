@@ -1,5 +1,5 @@
 /*
- * Fused DeltaNet Recurrent State Update - CUDA V3
+ * Fused DeltaNet Recurrent State Update - CUDA
  *
  * Best-of-breed design combining all proven optimizations:
  *   1. float4 (128-bit) vectorized state load/store
@@ -52,7 +52,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-__global__ void deltanet_recurrent_v3_kernel(
+__global__ void deltanet_recurrent_kernel(
     const __nv_bfloat16* __restrict__ Q,
     const __nv_bfloat16* __restrict__ K_in,
     const __nv_bfloat16* __restrict__ V_in,
@@ -201,7 +201,7 @@ __global__ void deltanet_recurrent_v3_kernel(
 }
 
 
-std::vector<torch::Tensor> deltanet_recurrent_cuda_v3_forward(
+std::vector<torch::Tensor> deltanet_recurrent_cuda_forward(
     torch::Tensor q,
     torch::Tensor k,
     torch::Tensor v,
@@ -224,7 +224,7 @@ std::vector<torch::Tensor> deltanet_recurrent_cuda_v3_forward(
     dim3 grid(NV_BLOCKS, B * HV);
     dim3 block(BLOCK_SIZE);
 
-    deltanet_recurrent_v3_kernel<<<grid, block>>>(
+    deltanet_recurrent_kernel<<<grid, block>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(k.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()),
@@ -245,6 +245,6 @@ std::vector<torch::Tensor> deltanet_recurrent_cuda_v3_forward(
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &deltanet_recurrent_cuda_v3_forward,
-          "DeltaNet recurrent step CUDA V3 4-warp vectorized forward");
+    m.def("forward", &deltanet_recurrent_cuda_forward,
+          "DeltaNet recurrent step CUDA forward");
 }
