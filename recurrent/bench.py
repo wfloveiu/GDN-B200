@@ -208,8 +208,71 @@ def bench_kernel(kernel_fn, batch_size):
     return benchmark_fn(kernel_fn, inputs)
 
 
+@torch.no_grad()
+def test_correctness(batch_size=4):
+    """Compare CUDA kernel against ref() and print error metrics."""
+    torch.manual_seed(42)
+    inputs = get_inputs(batch_size)
+    B, T, H, K = inputs["q"].shape
+    HV, V = inputs["v"].shape[2], inputs["v"].shape[3]
+
+    # --- Run ref ---
+    ref_output, ref_state = ref(
+        inputs["q"], inputs["k"], inputs["v"],
+        inputs["state"].clone(),
+        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
+        inputs["scale"],
+    )
+
+    # --- Run CUDA kernel ---
+    cuda_output = torch.empty(B, T, HV, V, device="cuda", dtype=torch.bfloat16)
+    cuda_state = torch.empty(B, HV, V, K, device="cuda", dtype=torch.float32)
+    cuda_kernel(
+        inputs["q"], inputs["k"], inputs["v"],
+        inputs["state"].clone(),
+        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
+        inputs["scale"],
+        cuda_output, cuda_state,
+    )
+
+    # --- Compare ---
+    print("=" * 62)
+    print(f"  Correctness Test: CUDA vs ref  (B={batch_size})")
+    print("-" * 62)
+
+    for label, test, reference in [
+        ("Output", cuda_output.float(), ref_output.float()),
+        ("State",  cuda_state.float(),  ref_state.float()),
+    ]:
+        diff = (test - reference).abs()
+        max_abs = diff.max().item()
+        mean_abs = diff.mean().item()
+
+        # values at max abs error position
+        flat = diff.reshape(-1)
+        idx = flat.argmax().item()
+        ref_val = reference.reshape(-1)[idx].item()
+        test_val = test.reshape(-1)[idx].item()
+
+        denom = reference.abs().clamp(min=1e-8)
+        max_rel = (diff / denom).max().item()
+
+        print(f"  {label:7s} | max_abs_err: {max_abs:.6f}  (ref={ref_val:.6f}, cuda={test_val:.6f})")
+        print(f"  {'':7s} | mean_abs_err: {mean_abs:.6f}  max_rel_err: {max_rel:.6f}")
+
+    passed = (cuda_output.float() - ref_output.float()).abs().max().item() < 0.1
+    status = "PASS" if passed else "FAIL"
+    print(f"  Status  | {status}")
+    print("=" * 62)
+    return passed
+
+
 if __name__ == "__main__":
     torch.manual_seed(42)
+
+    # Correctness test first
+    test_correctness(batch_size=4)
+    print()
 
     # Kernels to benchmark
     std_kernels = {
