@@ -1,8 +1,5 @@
 import torch
 from Triton_recurrent import kernel as qwen_kernel
-from Triton_recurrent import _deltanet_recurrent_v3_kernel as qwen_triton_kernel
-from CUDA_recurrent_v1 import kernel as cuda_kernel
-from CUDA_recurrent_v2 import kernel as cuda_v2_kernel
 from CUDA_recurrent_v3 import kernel as cuda_v3_kernel
 from cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
 import math
@@ -34,13 +31,13 @@ def get_inputs(batch_size=1):
 def ref(q, k, v, state, A_log, a, dt_bias, b, scale):
     """
     Gated Delta Net decode reference implementation (k-last layout).
-    
+
     State layout: [B, H, V, K] (k-last, K dimension at the end)
-    
+
     Gate computation:
     g = exp(-exp(A_log) * softplus(a + dt_bias))
     beta = sigmoid(b)
-    
+
     Delta rule update:
     state_new = g * state_old + k^T @ (beta * v + (1-beta) * k @ state_old) - k^T @ (k @ state_old)
     output = scale * q @ state_new
@@ -50,38 +47,35 @@ def ref(q, k, v, state, A_log, a, dt_bias, b, scale):
     _, _, num_v_heads, V = v.shape
     num_heads = num_v_heads
     device = q.device
-    
-    # assert num_q_heads == 4
-    # assert num_k_heads == 4
-    # assert num_v_heads == 8
+
     assert K == 128 and V == 128
     assert T == 1
-    
+
     if scale is None or scale == 0.0:
         scale = 1.0 / math.sqrt(K)
-    
+
     # Compute g and beta from raw parameters
     x = a.float() + dt_bias.float()  # [B, 1, HV]
     g = torch.exp(-torch.exp(A_log.float()) * F.softplus(x))  # [B, 1, HV]
     beta = torch.sigmoid(b.float())  # [B, 1, HV]
-    
+
     q_f32 = q.squeeze(1).float()
     k_f32 = k.squeeze(1).float()
     v_f32 = v.squeeze(1).float()
     g_f32 = g.squeeze(1).float()
     beta_f32 = beta.squeeze(1).float()
-    
+
     if state is not None:
         state_f32 = state.float()
     else:
         state_f32 = torch.zeros(B, num_heads, V, K, dtype=torch.float32, device=device)
-    
+
     q_exp = q_f32.repeat_interleave(num_v_heads // num_q_heads, dim=1)
     k_exp = k_f32.repeat_interleave(num_v_heads // num_k_heads, dim=1)
-    
+
     new_state = torch.zeros_like(state_f32)
     output = torch.zeros(B, num_heads, V, dtype=torch.float32, device=device)
-    
+
     for b_idx in range(B):
         for h_idx in range(num_heads):
             q_h = q_exp[b_idx, h_idx]
@@ -90,183 +84,19 @@ def ref(q, k, v, state, A_log, a, dt_bias, b, scale):
             h_state = state_f32[b_idx, h_idx].clone().transpose(-1, -2)  # [V,K] -> [K,V]
             g_val = g_f32[b_idx, h_idx]
             beta_val = beta_f32[b_idx, h_idx]
-            
+
             old_state = g_val * h_state
             old_v = k_h @ old_state
             new_v = beta_val * v_h + (1 - beta_val) * old_v
             state_remove = k_h.unsqueeze(1) @ old_v.unsqueeze(0)
             state_update = k_h.unsqueeze(1) @ new_v.unsqueeze(0)
             h_state = old_state - state_remove + state_update
-            
+
             output[b_idx, h_idx] = scale * (q_h @ h_state)
             new_state[b_idx, h_idx] = h_state.transpose(-1, -2)  # [K,V] -> [V,K]
-    
+
     output = output.unsqueeze(1).to(torch.bfloat16)
     return output, new_state
-
-
-def _print_diff(label, test_out, ref_out, test_st, ref_st):
-    """Print absolute/relative error table for output and state."""
-    abs_diff_out = (test_out - ref_out).abs()
-    rel_diff_out = abs_diff_out / (ref_out.abs() + 1e-6)
-    abs_diff_st = (test_st - ref_st).abs()
-    rel_diff_st = abs_diff_st / (ref_st.abs() + 1e-6)
-
-    print(f"--- Correctness: {label} ---")
-    print(f"{'':>28} {'Output':>14} {'State':>14}")
-    print("-" * 58)
-    print(f"{'Max  absolute error':>28} {abs_diff_out.max().item():>14.6f} {abs_diff_st.max().item():>14.6f}")
-    print(f"{'Mean absolute error':>28} {abs_diff_out.mean().item():>14.6f} {abs_diff_st.mean().item():>14.6f}")
-    print(f"{'Max  relative error':>28} {rel_diff_out.max().item():>14.6f} {rel_diff_st.max().item():>14.6f}")
-    print(f"{'Mean relative error':>28} {rel_diff_out.mean().item():>14.6f} {rel_diff_st.mean().item():>14.6f}")
-
-
-def qwen_accuracy(batch_size=1):
-    """Compare qwen_kernel vs ref() (PyTorch reference)."""
-    torch.manual_seed(42)
-    inputs = get_inputs(batch_size)
-    B, T, H, K = inputs["q"].shape
-    HV, V = inputs["v"].shape[2], inputs["v"].shape[3]
-
-    # --- Run ref (PyTorch reference) ---
-    ref_output, ref_state = ref(
-        inputs["q"], inputs["k"], inputs["v"],
-        inputs["state"].clone(),
-        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
-        inputs["scale"],
-    )
-
-    # --- Run qwen_kernel ---
-    qwen_output = torch.empty(B, T, HV, V, device="cuda", dtype=torch.bfloat16)
-    qwen_state = torch.empty(B, HV, V, K, device="cuda", dtype=torch.float32)
-    qwen_kernel(
-        inputs["q"], inputs["k"], inputs["v"],
-        inputs["state"].clone(),
-        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
-        inputs["scale"],
-        qwen_output, qwen_state,
-    )
-
-    # _print_diff("Qwen vs Ref",
-    #             qwen_output.float(), ref_output.float(),
-    #             qwen_state.float(), ref_state.float())
-
-    inputs["output"] = qwen_output
-    inputs["new_state"] = qwen_state
-    us = benchmark_fn(qwen_kernel, inputs)
-    best = qwen_triton_kernel.best_config
-    print(f"Qwen kernel latency: {us:.2f} us | best config: BV={best.kwargs['BV']}, num_warps={best.num_warps}, num_stages={best.num_stages}")
-
-
-
-
-
-def cuda_accuracy(batch_size=1):
-    """Compare cuda_kernel vs ref() (PyTorch reference)."""
-    torch.manual_seed(42)
-    inputs = get_inputs(batch_size)
-    B, T, H, K = inputs["q"].shape
-    HV, V = inputs["v"].shape[2], inputs["v"].shape[3]
-
-    # --- Run ref (PyTorch reference) ---
-    ref_output, ref_state = ref(
-        inputs["q"], inputs["k"], inputs["v"],
-        inputs["state"].clone(),
-        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
-        inputs["scale"],
-    )
-
-    # --- Run cuda_kernel ---
-    cuda_output = torch.empty(B, T, HV, V, device="cuda", dtype=torch.bfloat16)
-    cuda_state = torch.empty(B, HV, V, K, device="cuda", dtype=torch.float32)
-    cuda_kernel(
-        inputs["q"], inputs["k"], inputs["v"],
-        inputs["state"].clone(),
-        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
-        inputs["scale"],
-        cuda_output, cuda_state,
-    )
-
-    # _print_diff("CUDA vs Ref",
-    #             cuda_output.float(), ref_output.float(),
-    #             cuda_state.float(), ref_state.float())
-
-    inputs["output"] = cuda_output
-    inputs["new_state"] = cuda_state
-    us = benchmark_fn(cuda_kernel, inputs)
-    print(f"CUDA kernel latency: {us:.2f} us")
-
-
-def cuda_v2_accuracy(batch_size=1):
-    """Compare cuda_v2_kernel vs ref() (PyTorch reference)."""
-    torch.manual_seed(42)
-    inputs = get_inputs(batch_size)
-    B, T, H, K = inputs["q"].shape
-    HV, V = inputs["v"].shape[2], inputs["v"].shape[3]
-
-    # --- Run ref (PyTorch reference) ---
-    ref_output, ref_state = ref(
-        inputs["q"], inputs["k"], inputs["v"],
-        inputs["state"].clone(),
-        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
-        inputs["scale"],
-    )
-
-    # --- Run cuda_v2_kernel ---
-    cuda_v2_output = torch.empty(B, T, HV, V, device="cuda", dtype=torch.bfloat16)
-    cuda_v2_state = torch.empty(B, HV, V, K, device="cuda", dtype=torch.float32)
-    cuda_v2_kernel(
-        inputs["q"], inputs["k"], inputs["v"],
-        inputs["state"].clone(),
-        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
-        inputs["scale"],
-        cuda_v2_output, cuda_v2_state,
-    )
-
-    _print_diff("CUDA_V2 vs Ref",
-                cuda_v2_output.float(), ref_output.float(),
-                cuda_v2_state.float(), ref_state.float())
-
-    inputs["output"] = cuda_v2_output
-    inputs["new_state"] = cuda_v2_state
-    us = benchmark_fn(cuda_v2_kernel, inputs)
-    print(f"CUDA_V2 kernel latency: {us:.2f} us")
-
-
-def cuda_v3_accuracy(batch_size=1):
-    """Compare cuda_v3_kernel vs ref() (PyTorch reference)."""
-    torch.manual_seed(42)
-    inputs = get_inputs(batch_size)
-    B, T, H, K = inputs["q"].shape
-    HV, V = inputs["v"].shape[2], inputs["v"].shape[3]
-
-    # --- Run ref (PyTorch reference) ---
-    ref_output, ref_state = ref(
-        inputs["q"], inputs["k"], inputs["v"],
-        inputs["state"].clone(),
-        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
-        inputs["scale"],
-    )
-
-    # --- Run cuda_v3_kernel ---
-    cuda_v3_output = torch.empty(B, T, HV, V, device="cuda", dtype=torch.bfloat16)
-    cuda_v3_state = torch.empty(B, HV, V, K, device="cuda", dtype=torch.float32)
-    cuda_v3_kernel(
-        inputs["q"], inputs["k"], inputs["v"],
-        inputs["state"].clone(),
-        inputs["A_log"], inputs["a"], inputs["dt_bias"], inputs["b"],
-        inputs["scale"],
-        cuda_v3_output, cuda_v3_state,
-    )
-
-    _print_diff("CUDA_V3 vs Ref",
-                cuda_v3_output.float(), ref_output.float(),
-                cuda_v3_state.float(), ref_state.float())
-
-    inputs["output"] = cuda_v3_output
-    inputs["new_state"] = cuda_v3_state
-    us = benchmark_fn(cuda_v3_kernel, inputs)
-    print(f"CUDA_V3 kernel latency: {us:.2f} us")
 
 
 def bench_cutedsl(batch_size):
@@ -381,14 +211,11 @@ def bench_kernel(kernel_fn, batch_size):
 if __name__ == "__main__":
     torch.manual_seed(42)
 
-    # Standard kernels (same interface)
+    # Kernels to benchmark
     std_kernels = {
         "Qwen(Triton)": qwen_kernel,
-        "CUDA_V1":      cuda_kernel,
-        "CUDA_V2":      cuda_v2_kernel,
         "CUDA_V3":      cuda_v3_kernel,
     }
-    # All kernel names including CuTe DSL
     kernel_names = list(std_kernels.keys()) + ["CuTeDSL"]
 
     # Collect all results: {bs: {name: latency_us}}
@@ -443,4 +270,3 @@ if __name__ == "__main__":
         print(f" | {'lower=better':>{col_w}}", end="")
     print(f" | {'':>{col_w}}")
     print()
-
