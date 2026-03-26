@@ -2,13 +2,14 @@ import torch
 from Triton_recurrent import kernel as qwen_kernel
 from CUDA_recurrent import kernel as cuda_kernel
 from CUDA_recurrent_async import kernel as cuda_async_kernel
+from CUDA_recurrent_tma import kernel as cuda_tma_kernel
 from cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
 import math
 import torch.nn.functional as F
 
 BATCH_SIZES = [1, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
-NUM_KHEADS = 4
-NUM_VHEADS = 8
+NUM_KHEADS = 8
+NUM_VHEADS = 16
 DK = 128
 DV = 128
 
@@ -217,6 +218,7 @@ if __name__ == "__main__":
         "Qwen(Triton)": qwen_kernel,
         "CUDA":         cuda_kernel,
         "CUDA_async":   cuda_async_kernel,
+        "CUDA_tma":     cuda_tma_kernel,
     }
     kernel_names = list(std_kernels.keys()) + ["CuTeDSL"]
 
