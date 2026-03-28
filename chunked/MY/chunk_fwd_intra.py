@@ -150,12 +150,12 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     b_A11 = tl.where(m_d & (m_tc1[:, None] & m_tc1[None, :]), b_A11, 0.) * b_b1[:, None]
     b_A22 = tl.where(m_d & (m_tc2[:, None] & m_tc2[None, :]), b_A22, 0.) * b_b2[:, None]
     b_A33 = tl.where(m_d & (m_tc3[:, None] & m_tc3[None, :]), b_A33, 0.) * b_b3[:, None]
-    b_A10 = b_A10 * b_b1[:, None]
-    b_A20 = b_A20 * b_b2[:, None]
-    b_A21 = b_A21 * b_b2[:, None]
-    b_A30 = b_A30 * b_b3[:, None]
-    b_A31 = b_A31 * b_b3[:, None]
-    b_A32 = b_A32 * b_b3[:, None]
+    b_A10 = tl.where(m_tc1[:, None] & m_tc0[None, :], b_A10, 0.) * b_b1[:, None]
+    b_A20 = tl.where(m_tc2[:, None] & m_tc0[None, :], b_A20, 0.) * b_b2[:, None]
+    b_A21 = tl.where(m_tc2[:, None] & m_tc1[None, :], b_A21, 0.) * b_b2[:, None]
+    b_A30 = tl.where(m_tc3[:, None] & m_tc0[None, :], b_A30, 0.) * b_b3[:, None]
+    b_A31 = tl.where(m_tc3[:, None] & m_tc1[None, :], b_A31, 0.) * b_b3[:, None]
+    b_A32 = tl.where(m_tc3[:, None] & m_tc2[None, :], b_A32, 0.) * b_b3[:, None]
 
     # Step 3: forward substitution on diagonal blocks
     b_Ai00 = -b_A00
@@ -232,15 +232,16 @@ def chunk_gated_delta_rule_fwd_intra(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused kkt + solve_tril + recompute_w_u."""
     B, T, Hk, K = k.shape
-    H = beta.shape[-1]
+    H = beta.shape[-1] # H = HV
     BT = 64
     BC = 16
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    A = torch.empty(B, T, H, BT, device=k.device, dtype=k.dtype)
+    A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
     chunk_gated_delta_rule_fwd_kkt_solve_kernel[(NT, B * H)](
         k=k, g=g, beta=beta, A=A,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,

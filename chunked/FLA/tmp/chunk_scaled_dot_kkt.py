@@ -5,9 +5,9 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.ops.utils import prepare_chunk_indices
-from fla.ops.utils.op import exp
-from fla.utils import autotune_cache_kwargs
+from utils import prepare_chunk_indices
+from utils import exp
+from utils import autotune_cache_kwargs
 
 
 @triton.heuristics({
@@ -17,11 +17,11 @@ from fla.utils import autotune_cache_kwargs
 @triton.autotune(
     configs=[
         triton.Config({'BK': BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        for BK in [64, 128]
+        for num_warps in [4, 8]
+        for num_stages in [1, 2, 3]
     ],
-    key=['H', 'K', 'BT', 'IS_VARLEN'],
+    key=['H', 'Hk', 'K', 'BT', 'IS_VARLEN'],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -34,6 +34,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     chunk_indices,
     T,
     H: tl.constexpr,
+    Hk: tl.constexpr,
     K: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
@@ -42,6 +43,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
+    i_hk = i_h // (H // Hk)
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
@@ -56,7 +58,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(k + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+        p_k = tl.make_block_ptr(k + (bos*Hk + i_hk) * K, (T, K), (Hk*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_A += tl.dot(b_k, tl.trans(b_k))
 
@@ -87,13 +89,11 @@ def chunk_scaled_dot_kkt_fwd(
 
     Args:
         k (torch.Tensor):
-            The key tensor of shape `[B, T, H, K]`.
+            The key tensor of shape `[B, T, Hk, K]`.
         beta (torch.Tensor):
             The beta tensor of shape `[B, T, H]`.
         g (torch.Tensor):
             The cumulative sum of the gate tensor of shape `[B, T, H]`. Default: `None`.
-        gk (torch.Tensor):
-            The cumulative sum of the gate tensor of shape `[B, T, H, K]` applied to the key tensor. Default: `None`.
         cu_seqlens (torch.LongTensor):
             The cumulative sequence lengths of the input tensor.
             Default: None
@@ -101,11 +101,15 @@ def chunk_scaled_dot_kkt_fwd(
             The chunk size. Default: 64.
         output_dtype (torch.dtype):
             The dtype of the output tensor. Default: `torch.float32`
+        H (int):
+            Number of v-heads (for GQA). If None, defaults to k's head count.
 
     Returns:
         beta * K * K^T of shape `[B, T, H, BT]` where `BT` is the chunk size.
     """
-    B, T, H, K = k.shape
+    B, T, Hk, K = k.shape
+    H = beta.shape[-1]
+
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -120,6 +124,7 @@ def chunk_scaled_dot_kkt_fwd(
         chunk_indices=chunk_indices,
         T=T,
         H=H,
+        Hk=Hk,
         K=K,
         BT=BT,
     )

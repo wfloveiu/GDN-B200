@@ -32,6 +32,7 @@ def _run_cmd(cmd: list[str]):
 
 @app.function(image=image, gpu="B200", timeout=60 * 60)
 def run_bench():
+    _run_cmd(["rm", "-rf", "/root/.triton/cache", "/tmp/triton_cache"])
     _run_cmd(["python", "bench.py"])
 
 

@@ -3,14 +3,12 @@ import math
 import torch
 import torch.nn.functional as F
 
-from index import prepare_chunk_indices
-from fla_utils import input_guard
+from utils import prepare_chunk_indices, input_guard, autocast_custom_fwd
 from cumsum import chunk_local_cumsum
-from chunk_fwd import chunk_gated_delta_rule_fwd_intra
+from chunk_fwd_intra import chunk_gated_delta_rule_fwd_intra
 from chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from chunk_o import chunk_fwd_o
 from fused_gdn_gating import fused_gdn_gating
-
 
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
@@ -23,9 +21,10 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    transpose_state_layout: bool = False,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices)
-
+    # fused kkt + solve_tril + recompute_w_u (avoids HBM round-trip for A)
     w, u, _ = chunk_gated_delta_rule_fwd_intra(
         k=k,
         v=v,
@@ -44,6 +43,7 @@ def chunk_gated_delta_rule_fwd(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        transpose_state_layout=transpose_state_layout,
     )
 
     o = chunk_fwd_o(
@@ -55,14 +55,16 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        transpose_state_layout=transpose_state_layout,
     )
     return o, final_state
+
 
 
 @torch.compiler.disable
 def chunk_gated_delta_rule(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
     """
-    Chunked gated delta rule - official FLA version.
+    Chunked gated delta rule with the same interface as baseline_run.
 
     Inputs:
         q: [total_seq_len, num_q_heads, head_size] bfloat16
@@ -79,23 +81,20 @@ def chunk_gated_delta_rule(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, sca
         output: [total_seq_len, num_v_heads, head_size] bfloat16
         new_state: [num_seqs, num_v_heads, head_size, head_size] float32
     """
-    total_seq_len, num_q_heads, head_size = q.shape
-    num_k_heads = k.shape[1]
-    num_v_heads = v.shape[1]
+    _, _, head_size = q.shape
 
     if scale is None or scale == 0.0:
         scale = 1.0 / math.sqrt(head_size)
 
-    g_log, beta = fused_gdn_gating(A_log, a, b, dt_bias)  # [1, T, HV]
 
-    # Expand q and k to match num_v_heads (GQA → MHA)
-    q_exp = q.repeat_interleave(num_v_heads // num_q_heads, dim=1)  # [T, HV, K]
-    k_exp = k.repeat_interleave(num_v_heads // num_k_heads, dim=1)  # [T, HV, K]
-
-    # Reshape 3D -> 4D (B=1 for varlen mode)
-    q_4d = q_exp.unsqueeze(0)   # [1, T, HV, K]
-    k_4d = k_exp.unsqueeze(0)   # [1, T, HV, K]
-    v_4d = v.unsqueeze(0)       # [1, T, HV, V]
+    g_log, beta = fused_gdn_gating(A_log, a, b, dt_bias) # [1, T, HV]
+    
+    # print(f"g_log{g_log}")
+    # print(f"beta{beta}")
+    # ---------- reshape 3D -> 4D (B=1 for varlen mode) ----------
+    q_4d = q.unsqueeze(0)                                   # [1, T, Hq, K]
+    k_4d = k.unsqueeze(0)                                   # [1, T, Hk, K]
+    v_4d = v.unsqueeze(0)                                   # [1, T, HV, V]
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, 64) if cu_seqlens is not None else None
     o, final_state = chunk_gated_delta_rule_fwd(
@@ -109,7 +108,10 @@ def chunk_gated_delta_rule(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, sca
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        transpose_state_layout=True,
     )
 
     output = o.squeeze(0)
+
+
     return output, final_state
