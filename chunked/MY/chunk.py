@@ -10,6 +10,12 @@ from chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from chunk_o import chunk_fwd_o
 from fused_gdn_gating import fused_gdn_gating
 
+# 1/ln(2) for converting ln-base gate to log2-base gate
+RCP_LN2 = 1.4426950216
+
+USE_EXP2 = False
+
+
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -23,7 +29,13 @@ def chunk_gated_delta_rule_fwd(
     chunk_indices: torch.LongTensor | None = None,
     transpose_state_layout: bool = False,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices)
+    # cumsum with optional base conversion: g_ln -> g_log2
+    g = chunk_local_cumsum(
+        g, chunk_size=64,
+        scale=RCP_LN2 if USE_EXP2 else None,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
     # fused kkt + solve_tril + recompute_w_u (avoids HBM round-trip for A)
     w, u, _ = chunk_gated_delta_rule_fwd_intra(
         k=k,
@@ -32,6 +44,7 @@ def chunk_gated_delta_rule_fwd(
         beta=beta,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        use_exp2=USE_EXP2,
     )
 
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
@@ -44,6 +57,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         transpose_state_layout=transpose_state_layout,
+        use_exp2=USE_EXP2,
     )
 
     o = chunk_fwd_o(
@@ -56,6 +70,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         transpose_state_layout=transpose_state_layout,
+        use_exp2=USE_EXP2,
     )
     return o, final_state
 
@@ -86,11 +101,8 @@ def chunk_gated_delta_rule(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, sca
     if scale is None or scale == 0.0:
         scale = 1.0 / math.sqrt(head_size)
 
-
     g_log, beta = fused_gdn_gating(A_log, a, b, dt_bias) # [1, T, HV]
-    
-    # print(f"g_log{g_log}")
-    # print(f"beta{beta}")
+
     # ---------- reshape 3D -> 4D (B=1 for varlen mode) ----------
     q_4d = q.unsqueeze(0)                                   # [1, T, Hq, K]
     k_4d = k.unsqueeze(0)                                   # [1, T, Hk, K]
@@ -112,6 +124,5 @@ def chunk_gated_delta_rule(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, sca
     )
 
     output = o.squeeze(0)
-
 
     return output, final_state

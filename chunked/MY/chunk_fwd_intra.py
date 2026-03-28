@@ -5,7 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import prepare_chunk_indices, exp, autotune_cache_kwargs, IS_TMA_SUPPORTED
+from utils import prepare_chunk_indices, exp, exp2, autotune_cache_kwargs, IS_TMA_SUPPORTED
 from wy_fast import recompute_w_u_fwd
 
 
@@ -43,6 +43,7 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     BK: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
     USE_G: tl.constexpr,
+    USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     """Fused kkt + solve_tril: compute beta * K @ K^T and (I+A)^{-1} in one pass."""
@@ -132,16 +133,28 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
 
     # Step 2: apply gate and beta scaling
     if USE_G:
-        b_A00 *= exp(b_g0[:, None] - b_g0[None, :])
-        b_A11 *= exp(b_g1[:, None] - b_g1[None, :])
-        b_A22 *= exp(b_g2[:, None] - b_g2[None, :])
-        b_A33 *= exp(b_g3[:, None] - b_g3[None, :])
-        b_A10 *= exp(b_g1[:, None] - b_g0[None, :])
-        b_A20 *= exp(b_g2[:, None] - b_g0[None, :])
-        b_A21 *= exp(b_g2[:, None] - b_g1[None, :])
-        b_A30 *= exp(b_g3[:, None] - b_g0[None, :])
-        b_A31 *= exp(b_g3[:, None] - b_g1[None, :])
-        b_A32 *= exp(b_g3[:, None] - b_g2[None, :])
+        if USE_EXP2:
+            b_A00 *= exp2(b_g0[:, None] - b_g0[None, :])
+            b_A11 *= exp2(b_g1[:, None] - b_g1[None, :])
+            b_A22 *= exp2(b_g2[:, None] - b_g2[None, :])
+            b_A33 *= exp2(b_g3[:, None] - b_g3[None, :])
+            b_A10 *= exp2(b_g1[:, None] - b_g0[None, :])
+            b_A20 *= exp2(b_g2[:, None] - b_g0[None, :])
+            b_A21 *= exp2(b_g2[:, None] - b_g1[None, :])
+            b_A30 *= exp2(b_g3[:, None] - b_g0[None, :])
+            b_A31 *= exp2(b_g3[:, None] - b_g1[None, :])
+            b_A32 *= exp2(b_g3[:, None] - b_g2[None, :])
+        else:
+            b_A00 *= exp(b_g0[:, None] - b_g0[None, :])
+            b_A11 *= exp(b_g1[:, None] - b_g1[None, :])
+            b_A22 *= exp(b_g2[:, None] - b_g2[None, :])
+            b_A33 *= exp(b_g3[:, None] - b_g3[None, :])
+            b_A10 *= exp(b_g1[:, None] - b_g0[None, :])
+            b_A20 *= exp(b_g2[:, None] - b_g0[None, :])
+            b_A21 *= exp(b_g2[:, None] - b_g1[None, :])
+            b_A30 *= exp(b_g3[:, None] - b_g0[None, :])
+            b_A31 *= exp(b_g3[:, None] - b_g1[None, :])
+            b_A32 *= exp(b_g3[:, None] - b_g2[None, :])
 
     m_d = o_i[:, None] > o_i[None, :]
     m_I = o_i[:, None] == o_i[None, :]
@@ -229,6 +242,7 @@ def chunk_gated_delta_rule_fwd_intra(
     beta: torch.Tensor,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    use_exp2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused kkt + solve_tril + recompute_w_u."""
     B, T, Hk, K = k.shape
@@ -246,10 +260,12 @@ def chunk_gated_delta_rule_fwd_intra(
         k=k, g=g, beta=beta, A=A,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         T=T, H=H, Hk=Hk, K=K, BT=BT, BC=BC,
+        USE_EXP2=use_exp2,
     )
 
     w, u = recompute_w_u_fwd(
         k=k, v=v, beta=beta, A=A, g=g,
         cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
+        use_exp2=use_exp2,
     )
     return w, u, A

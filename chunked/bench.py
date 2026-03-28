@@ -13,6 +13,7 @@ if hasattr(triton, 'set_allocator'):
 
 # Import MY kernel
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "MY"))
+import chunk as my_chunk_module
 from chunk import chunk_gated_delta_rule as my_chunk_gated_delta_rule
 
 # Import SGLang kernel
@@ -46,12 +47,10 @@ def make_inputs(num_seqs, seq_len, num_q_heads=4, num_k_heads=4, num_v_heads=8,
 # ===================== Benchmark utils (match official harness) =====================
 
 def _clone_args(args):
-    """Clone all tensor arguments (same as official harness)."""
     return tuple(a.clone() if isinstance(a, torch.Tensor) else a for a in args)
 
 
 def do_bench_cold(fn, args, warmup=5, rep=10, device="cuda"):
-    """Cold cache benchmark: flush L2 + clone inputs each iteration."""
     cache = torch.empty(256 * 1024 * 1024 // 4, dtype=torch.int, device=device)
 
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(rep)]
@@ -76,25 +75,19 @@ def do_bench_cold(fn, args, warmup=5, rep=10, device="cuda"):
     return sum(times) / len(times)
 
 
-# ===================== MY wrapper =====================
+# ===================== Wrappers =====================
 
 def run_my(q, k, v, state, A_log, a_param, dt_bias, b_param, cu_seqlens, scale):
     return my_chunk_gated_delta_rule(q, k, v, state, A_log, a_param, dt_bias, b_param, cu_seqlens, scale)
 
 
-# ===================== SGLang wrapper =====================
-
 def run_sglang(q, k, v, state, A_log, a_param, dt_bias, b_param, cu_seqlens, scale):
     g_log, beta = sglang_gating(A_log, a_param, b_param, dt_bias)
-
-    # SGLang natively supports GQA (Hg != H), no repeat_interleave needed
     q_4d = q.unsqueeze(0)
     k_4d = k.unsqueeze(0)
     v_4d = v.unsqueeze(0)
-
     num_seqs = cu_seqlens.size(0) - 1
     initial_state_indices = torch.arange(num_seqs, dtype=torch.long, device=q.device)
-
     _, o, _, _, _, _ = sglang_fwd(
         q=q_4d, k=k_4d, v=v_4d,
         g=g_log, beta=beta, scale=scale,
@@ -121,21 +114,35 @@ def benchmark():
     warmup = 5
     rep = 10
 
-    print("=" * 110)
-    print(f"{'seqs':>5} {'seq_len':>8} {'total_T':>8} {'QK_h':>5} {'V_h':>5} | {'MY (ms)':>10} {'SGLang (ms)':>12} {'Speedup':>8}")
-    print("-" * 110)
+    print("=" * 130)
+    print(f"{'seqs':>5} {'seq_len':>8} {'total_T':>8} {'QK_h':>5} {'V_h':>5} | "
+          f"{'MY exp (ms)':>12} {'MY exp2 (ms)':>13} {'SGLang (ms)':>12} | "
+          f"{'exp2/exp':>9} {'MY/SG':>7}")
+    print("-" * 130)
 
     for num_seqs, seq_len, nq, nk, nv in configs:
         args = make_inputs(num_seqs, seq_len, num_q_heads=nq, num_k_heads=nk, num_v_heads=nv)
 
-        ms_my = do_bench_cold(run_my, args, warmup=warmup, rep=rep)
+        # MY with exp (USE_EXP2=False)
+        my_chunk_module.USE_EXP2 = False
+        ms_exp = do_bench_cold(run_my, args, warmup=warmup, rep=rep)
+
+        # MY with exp2 (USE_EXP2=True)
+        my_chunk_module.USE_EXP2 = True
+        ms_exp2 = do_bench_cold(run_my, args, warmup=warmup, rep=rep)
+
+        # SGLang
         ms_sg = do_bench_cold(run_sglang, args, warmup=warmup, rep=rep)
 
-        speedup = ms_sg / ms_my if ms_my > 0 else float('inf')
+        exp2_vs_exp = ms_exp / ms_exp2 if ms_exp2 > 0 else 0
+        best_my = min(ms_exp, ms_exp2)
+        my_vs_sg = ms_sg / best_my if best_my > 0 else 0
 
-        print(f"{num_seqs:>5} {seq_len:>8} {num_seqs*seq_len:>8} {nq:>5} {nv:>5} | {ms_my:>10.3f} {ms_sg:>12.3f} {speedup:>7.2f}x")
+        print(f"{num_seqs:>5} {seq_len:>8} {num_seqs*seq_len:>8} {nq:>5} {nv:>5} | "
+              f"{ms_exp:>12.3f} {ms_exp2:>13.3f} {ms_sg:>12.3f} | "
+              f"{exp2_vs_exp:>8.2f}x {my_vs_sg:>6.2f}x")
 
-    print("=" * 110)
+    print("=" * 130)
 
 
 # ===================== Main =====================

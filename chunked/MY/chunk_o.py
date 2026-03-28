@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import prepare_chunk_indices, exp, IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
+from utils import prepare_chunk_indices, exp, exp2, IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
 
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
@@ -47,6 +47,7 @@ def chunk_fwd_kernel_o(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     USE_G_GAMMA: tl.constexpr,
+    USE_EXP2: tl.constexpr,
     TRANSPOSE_STATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
@@ -100,14 +101,22 @@ def chunk_fwd_kernel_o(
         g += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
         b_g = tl.load(p_g, boundary_check=(0,))
-        b_o = b_o * exp(b_g)[:, None]
-        b_A = b_A * exp(b_g[:, None] - b_g[None, :])
+        if USE_EXP2:
+            b_o = b_o * exp2(b_g)[:, None]
+            b_A = b_A * exp2(b_g[:, None] - b_g[None, :])
+        else:
+            b_o = b_o * exp(b_g)[:, None]
+            b_A = b_A * exp(b_g[:, None] - b_g[None, :])
 
     if USE_G_GAMMA:
         b_gamma = tl.load(g_gamma + i_h)
         b_g = b_gamma * (tl.arange(0, BT) + 1)
-        b_o = b_o * exp(b_g)[:, None]
-        b_A = b_A * exp(b_g[:, None] - b_g[None, :])
+        if USE_EXP2:
+            b_o = b_o * exp2(b_g)[:, None]
+            b_A = b_A * exp2(b_g[:, None] - b_g[None, :])
+        else:
+            b_o = b_o * exp(b_g)[:, None]
+            b_A = b_A * exp(b_g[:, None] - b_g[None, :])
 
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
@@ -136,6 +145,7 @@ def chunk_fwd_o(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
     transpose_state_layout: bool = False,
+    use_exp2: bool = False,
 ) -> torch.Tensor:
     B, T, Hk, K = q.shape
     H, V = v.shape[-2], v.shape[-1]
@@ -165,6 +175,7 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
+        USE_EXP2=use_exp2,
         TRANSPOSE_STATE=transpose_state_layout,
     )
     return o

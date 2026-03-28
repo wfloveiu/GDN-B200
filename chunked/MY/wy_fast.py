@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from utils import prepare_chunk_indices, exp, autotune_cache_kwargs, check_shared_mem
+from utils import prepare_chunk_indices, exp, exp2, autotune_cache_kwargs, check_shared_mem
 
 
 @triton.heuristics({
@@ -40,6 +40,7 @@ def recompute_w_u_fwd_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
+    USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
@@ -67,7 +68,10 @@ def recompute_w_u_fwd_kernel(
 
     if USE_G:
         p_g = tl.make_block_ptr(g + (bos*H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = exp(tl.load(p_g, boundary_check=(0,)))
+        if USE_EXP2:
+            b_g = exp2(tl.load(p_g, boundary_check=(0,)))
+        else:
+            b_g = exp(tl.load(p_g, boundary_check=(0,)))
 
     for i_k in range(tl.cdiv(K, BK)):
         p_k = tl.make_block_ptr(k + (bos*Hk + i_hk) * K, (T, K), (Hk*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
@@ -88,6 +92,7 @@ def recompute_w_u_fwd(
     g: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.LongTensor | None = None,
+    use_exp2: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, Hk, K = k.shape
     H, V = v.shape[-2], v.shape[-1]
@@ -119,5 +124,6 @@ def recompute_w_u_fwd(
         BT=BT,
         BK=BK,
         BV=BV,
+        USE_EXP2=use_exp2,
     )
     return w, u
