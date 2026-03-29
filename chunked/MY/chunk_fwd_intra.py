@@ -18,9 +18,10 @@ DOT_PRECISION_LIST = ['tf32'] if IS_TMA_SUPPORTED else ['ieee']
 })
 @triton.autotune(
     configs=[
-        triton.Config({'BK': BK, 'DOT_PRECISION': prec}, num_warps=num_warps)
+        triton.Config({'BK': BK, 'DOT_PRECISION': prec}, num_warps=num_warps, num_stages=num_stages)
         for BK in [32, 64, 128]
         for num_warps in [1, 2, 4]
+        for num_stages in [1, 2]
         for prec in DOT_PRECISION_LIST
     ],
     key=['H', 'Hk', 'K', 'BC'],

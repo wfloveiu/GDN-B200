@@ -6,13 +6,12 @@ It uses the CUDA profiler API (cudaProfilerStart/Stop) so that NCU only
 captures the final "clean" invocation — skipping autotune + warmup entirely.
 
 Kernels profiled (in one call to chunk_gated_delta_rule):
-  1. fused_gdn_gating_kernel          — gate computation (g, beta)
-  2. chunk_local_cumsum_scalar_kernel  — chunk-local cumulative sum
-  3. chunk_scaled_dot_kkt_fwd_kernel   — beta * K * K^T
-  4. solve_tril / merge kernels        — lower-triangular inverse (I+A)^-1
-  5. recompute_w_u_fwd_kernel          — WY representation (w, u)
-  6. chunk_gated_delta_rule_fwd_kernel_h — state recurrence (bottleneck)
-  7. chunk_fwd_kernel_o                — output computation
+  1. fused_gdn_gating_kernel                       — gate computation (g, beta)
+  2. chunk_local_cumsum_scalar_kernel               — chunk-local cumulative sum
+  3. chunk_gated_delta_rule_fwd_kkt_solve_kernel    — fused kkt + solve_tril
+  4. recompute_w_u_fwd_kernel                       — WY representation (w, u)
+  5. chunk_gated_delta_rule_fwd_kernel_h_blockdim64 — state recurrence (bottleneck)
+  6. chunk_fwd_kernel_o                             — output computation
 
 Usage:
     # Profile all kernels (fast — only captures one clean invocation):
@@ -49,8 +48,8 @@ if hasattr(triton, 'set_allocator'):
         return torch.empty(size, dtype=torch.uint8, device='cuda')
     triton.set_allocator(_torch_allocator)
 
-# Add FLA directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "FLA"))
+# Add MY directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "MY"))
 
 from chunk import chunk_gated_delta_rule
 

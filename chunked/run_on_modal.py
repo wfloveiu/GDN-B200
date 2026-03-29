@@ -37,6 +37,13 @@ def run_bench():
 
 
 @app.function(image=image, gpu="B200", timeout=60 * 60)
+def run_opt():
+    """Run MY-only correctness + benchmark."""
+    _run_cmd(["rm", "-rf", "/root/.triton/cache", "/tmp/triton_cache"])
+    _run_cmd(["python", "opt_my.py"])
+
+
+@app.function(image=image, gpu="B200", timeout=60 * 60)
 def run_all():
     """Run all kernels sequentially."""
     _run_cmd(["python", "bench.py"])
@@ -82,6 +89,7 @@ def run_ncu(
 def main(which: str = "all"):
     dispatch = {
         "bench": run_bench,
+        "opt": run_opt,
         "all": run_all,
         "ncu": run_ncu,
     }
