@@ -2,3 +2,7 @@ einops
 ninja
 numpy
 packaging
+nvidia-cutlass-dsl
+cuda-python<13
+cuda-bindings>=12.9.4,<13
+apache-tvm-ffi

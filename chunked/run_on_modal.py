@@ -9,7 +9,7 @@ app = modal.App(APP_NAME)
 
 image = (
     modal.Image.from_registry(
-        "nvcr.io/nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11"
+        "nvcr.io/nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12"
     )
     .apt_install("gcc", "g++")
     .run_commands(
